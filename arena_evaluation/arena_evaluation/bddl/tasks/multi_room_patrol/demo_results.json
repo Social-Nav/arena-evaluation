@@ -1,0 +1,116 @@
+{
+  "scenario_a_full_success": {
+    "task_id": "multi_room_patrol",
+    "description": "Navigate through kitchen, living room, and bedroom in order, approaching the designated landmark in each room.\n",
+    "success": true,
+    "subtasks_completed": 3,
+    "subtasks_total": 3,
+    "subtask_success_rate": 1.0,
+    "total_duration_s": 12.69999999999997,
+    "subtask_results": [
+      {
+        "subtask_id": "goto_kitchen",
+        "description": "Navigate to the kitchen table",
+        "success": true,
+        "started_at_s": 0.0,
+        "completed_at_s": 3.1000000000000014,
+        "duration_s": 3.1000000000000014,
+        "timed_out": false
+      },
+      {
+        "subtask_id": "goto_living_room",
+        "description": "Navigate to the living room sofa",
+        "success": true,
+        "started_at_s": 3.2000000000000015,
+        "completed_at_s": 7.29999999999999,
+        "duration_s": 4.099999999999989,
+        "timed_out": false
+      },
+      {
+        "subtask_id": "goto_bedroom",
+        "description": "Navigate to the bedroom desk",
+        "success": true,
+        "started_at_s": 7.39999999999999,
+        "completed_at_s": 11.999999999999973,
+        "duration_s": 4.599999999999984,
+        "timed_out": false
+      }
+    ]
+  },
+  "scenario_b_partial": {
+    "task_id": "multi_room_patrol",
+    "description": "Navigate through kitchen, living room, and bedroom in order, approaching the designated landmark in each room.\n",
+    "success": false,
+    "subtasks_completed": 2,
+    "subtasks_total": 3,
+    "subtask_success_rate": 0.6666666666666666,
+    "total_duration_s": 7.999999999999988,
+    "subtask_results": [
+      {
+        "subtask_id": "goto_kitchen",
+        "description": "Navigate to the kitchen table",
+        "success": true,
+        "started_at_s": 0.0,
+        "completed_at_s": 3.1000000000000014,
+        "duration_s": 3.1000000000000014,
+        "timed_out": false
+      },
+      {
+        "subtask_id": "goto_living_room",
+        "description": "Navigate to the living room sofa",
+        "success": true,
+        "started_at_s": 3.2000000000000015,
+        "completed_at_s": 7.29999999999999,
+        "duration_s": 4.099999999999989,
+        "timed_out": false
+      },
+      {
+        "subtask_id": "goto_bedroom",
+        "description": "Navigate to the bedroom desk",
+        "success": false,
+        "started_at_s": 7.39999999999999,
+        "completed_at_s": 7.999999999999988,
+        "duration_s": 0.5999999999999979,
+        "timed_out": false
+      }
+    ]
+  },
+  "scenario_c_minimal": {
+    "task_id": "multi_room_patrol",
+    "description": "Navigate through kitchen, living room, and bedroom in order, approaching the designated landmark in each room.\n",
+    "success": false,
+    "subtasks_completed": 1,
+    "subtasks_total": 3,
+    "subtask_success_rate": 0.3333333333333333,
+    "total_duration_s": 3.800000000000002,
+    "subtask_results": [
+      {
+        "subtask_id": "goto_kitchen",
+        "description": "Navigate to the kitchen table",
+        "success": true,
+        "started_at_s": 0.0,
+        "completed_at_s": 3.1000000000000014,
+        "duration_s": 3.1000000000000014,
+        "timed_out": false
+      },
+      {
+        "subtask_id": "goto_living_room",
+        "description": "Navigate to the living room sofa",
+        "success": false,
+        "started_at_s": 3.2000000000000015,
+        "completed_at_s": 3.800000000000002,
+        "duration_s": 0.6000000000000005,
+        "timed_out": false
+      },
+      {
+        "subtask_id": "goto_bedroom",
+        "description": "Navigate to the bedroom desk",
+        "success": false,
+        "started_at_s": null,
+        "completed_at_s": null,
+        "duration_s": null,
+        "timed_out": false
+      }
+    ]
+  }
+}

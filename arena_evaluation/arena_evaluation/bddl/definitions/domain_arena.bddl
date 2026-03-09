@@ -1,0 +1,10 @@
+; Arena-Rosnav BDDL domain definition
+; Navigation-centric predicates for mobile robot task evaluation
+(define (domain arena)
+    (:requirements :strips :adl)
+    (:predicates
+        (nextto ?obj1 ?obj2)
+        (inroom ?obj1 ?obj2)
+        (touching ?obj1 ?obj2)
+    )
+)

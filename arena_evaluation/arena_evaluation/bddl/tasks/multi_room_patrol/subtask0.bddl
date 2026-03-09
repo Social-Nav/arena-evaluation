@@ -1,0 +1,12 @@
+; Subtask 0: Navigate to the kitchen table
+(define (problem multi_room_patrol_subtask0)
+    (:domain arena)
+    (:objects
+        robot_1 kitchen_table_1 - object
+    )
+    (:init
+    )
+    (:goal (and
+        (nextto ?robot_1 ?kitchen_table_1)
+    ))
+)

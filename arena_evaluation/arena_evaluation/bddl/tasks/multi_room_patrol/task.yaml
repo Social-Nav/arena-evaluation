@@ -1,0 +1,39 @@
+# Multi-room patrol — long-horizon VLN task orchestration
+# Each subtask is a separate .bddl problem file evaluated sequentially.
+
+task:
+  id: multi_room_patrol
+  description: >
+    Navigate through kitchen, living room, and bedroom in order,
+    approaching the designated landmark in each room.
+
+  # Entity positions (used by the offline evaluator to create ArenaEntity objects)
+  entities:
+    robot_1:
+      type: robot
+      # position is dynamic — read from episode frames
+    kitchen_table_1:
+      type: object
+      position: [5.0, 3.0]
+    living_room_sofa_1:
+      type: object
+      position: [10.0, 7.0]
+    bedroom_desk_1:
+      type: object
+      position: [15.0, 2.0]
+
+  subtasks:
+    - id: goto_kitchen
+      description: "Navigate to the kitchen table"
+      bddl_file: subtask0.bddl
+      timeout_s: 60.0
+
+    - id: goto_living_room
+      description: "Navigate to the living room sofa"
+      bddl_file: subtask1.bddl
+      timeout_s: 60.0
+
+    - id: goto_bedroom
+      description: "Navigate to the bedroom desk"
+      bddl_file: subtask2.bddl
+      timeout_s: 60.0

@@ -1,31 +1,38 @@
-from glob import glob
 import os
 
 from setuptools import find_packages, setup
 
-package_name = 'arena_evaluation'
+
+package_name = "arena_evaluation"
+
 
 setup(
     name=package_name,
-    version='1.0.0',
-    packages=[package_name],
+    version="0.0.0",
+    packages=find_packages(where=".", include=[f"{package_name}*"]),
+    package_dir={"": "."},
     data_files=[
-        ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
-        ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'config'), glob('config/*.yaml')), # Include non-Python files (like launch files, configuration files, or other resources) in the package's installation
-                                                                                # Include the configuration file in the install directory
-    ],                                                                          
-    install_requires=['setuptools'],
+        ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
+        ("share/" + package_name, ["package.xml"]),
+    ],
+    install_requires=["setuptools", "pyyaml", "bddl>=3.5.0"],
     zip_safe=True,
-    maintainer='NamTruongTran',
-    maintainer_email='trannamtruong98@gmail.com',
-    description='Record, evaluate, and plot navigational metrics to evaluate ROS navigation planners',
-    license='BSD',
-    tests_require=['pytest'],
-    entry_points={
-        'console_scripts': [
-        'record = arena_evaluation.data_recorder_node:main',
-        'metrics = arena_evaluation.get_metrics:main',
+    maintainer="Name",
+    maintainer_email="your@email.com",
+    description="Arena metric engine for VLN + dynamic social navigation.",
+    license="MIT",
+    package_data={
+        package_name: [
+            "bddl/definitions/*.bddl",
+            "bddl/tasks/**/*.yaml",
+            "bddl/tasks/**/*.bddl",
         ],
+    },
+    entry_points={
+        "console_scripts": [
+            "arena-eval = arena_evaluation.cli:main",
+            "arena-episode-recorder = arena_evaluation.ros.episode_recorder_node:main",
+            "arena-bddl-evaluator = arena_evaluation.ros.bddl_evaluator_node:main",
+        ]
     },
 )
