@@ -40,6 +40,42 @@ from hunav_msgs.msg import Agents
 
 
 
+def create_topic_metadata(topic_name, type_str):
+    attempts = [
+        lambda: TopicMetadata(
+            id=0,
+            name=topic_name,
+            type=type_str,
+            serialization_format='cdr',
+            offered_qos_profiles=[],
+            type_description_hash='',
+        ),
+        lambda: TopicMetadata(
+            0,
+            topic_name,
+            type_str,
+            'cdr',
+            [],
+            '',
+        ),
+        lambda: TopicMetadata(
+            name=topic_name,
+            type=type_str,
+            serialization_format='cdr',
+            offered_qos_profiles='',
+        ),
+    ]
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_error = exc
+
+    raise last_error
+
+
 class DataCollector(Node):
 
     def __init__(self, topic, unique_name):
@@ -436,12 +472,7 @@ class BagRecorder(Node):
             msg_type = topic[2]
             # Construct the type string. This follows the convention "package/msg/MessageType"
             type_str = f"{msg_type.__module__.replace('.', '/')}/{msg_type.__name__}"
-            metadata = TopicMetadata(
-                name=topic_name,
-                type=type_str,
-                serialization_format='cdr',
-                offered_qos_profiles=''
-            )
+            metadata = create_topic_metadata(topic_name, type_str)
             self.writer.create_topic(metadata)
             self.topics_metadata[topic_name] = metadata
 

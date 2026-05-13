@@ -5,13 +5,14 @@ import csv
 import math
 import os
 import re
+import time
 import traceback
 from datetime import datetime
 
 import rclpy
 import yaml
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from hunav_msgs.msg import Agents
 from nav_msgs.msg import Odometry
 from rclpy.executors import MultiThreadedExecutor
@@ -24,12 +25,68 @@ from rosbag2_py import (ConverterOptions, SequentialWriter, StorageOptions,
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Int16
-# for transformations
-from tf_transformations import euler_from_quaternion
 
 # from arena_evaluation.scripts.utils import Pedestrian
 # import pedsim_msgs.msg           as pedsim_msgs
 import arena_evaluation_msgs.srv as arena_evaluation_srvs
+
+
+def euler_from_quaternion(quaternion):
+    """Convert quaternion ``(x, y, z, w)`` to Euler angles ``(roll, pitch, yaw)``."""
+    x, y, z, w = quaternion
+
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = math.copysign(math.pi / 2.0, sinp)
+    else:
+        pitch = math.asin(sinp)
+
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return (roll, pitch, yaw)
+
+
+def create_topic_metadata(topic_name, type_str):
+    topic_name = topic_name.strip('/')
+    attempts = [
+        lambda: TopicMetadata(
+            id=0,
+            name=topic_name,
+            type=type_str,
+            serialization_format='cdr',
+            offered_qos_profiles=[],
+            type_description_hash='',
+        ),
+        lambda: TopicMetadata(
+            0,
+            topic_name,
+            type_str,
+            'cdr',
+            [],
+            '',
+        ),
+        lambda: TopicMetadata(
+            name=topic_name,
+            type=type_str,
+            serialization_format='cdr',
+            offered_qos_profiles='',
+        ),
+    ]
+
+    last_error = None
+    for attempt in attempts:
+        try:
+            return attempt()
+        except TypeError as exc:
+            last_error = exc
+
+    raise last_error
 
 
 class DataCollector(Node):
@@ -60,6 +117,8 @@ class DataCollector(Node):
             return
 
         self.full_topic_name = topic[1]
+        # The actual ROS topic name to subscribe/record in a bag.
+        self.topic_name = topic[0]
         self.msg = None
         self.data = None
 
@@ -117,6 +176,12 @@ class DataCollector(Node):
         return (
             self.full_topic_name,
             self.data
+        )
+
+    def get_bag_message(self):
+        return (
+            self.topic_name,
+            self.msg,
         )
 
     def episode_callback(self, msg_scenario_reset):
@@ -201,6 +266,10 @@ class Recorder(Node):
 
         self.current_episode = 0
         self.current_time = None
+        self._last_seen_clock_time = None
+        self._last_clock_advance_wall_ns = None
+        self._last_record_wall_ns = None
+        self._record_period_ns = max(1, int(self.config["record_frequency"] * 1e6))
 
         self.qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -213,6 +282,10 @@ class Recorder(Node):
             "/clock",
             self.clock_callback,
             self.qos
+        )
+        self.wall_timer = self.create_timer(
+            self.config["record_frequency"] / 1000.0,
+            self._wall_clock_callback,
         )
 
         self.scenario_reset_sub = self.create_subscription(
@@ -360,6 +433,10 @@ class BagRecorder(Node):
         self.declare_parameter("world", "")
         self.world = self.get_parameter("world").value
 
+        # Topic overrides (needed because task_generator publishes task_reset under its fully-qualified name)
+        self.declare_parameter("scenario_reset_topic", "/scenario_reset")
+        self.declare_parameter("goal_topic", "goal_pose")
+
         self.base_dir = get_package_share_directory("arena_evaluation")
         self.result_dir = os.path.join(self.base_dir, "data", self.result_dir)
         os.makedirs(self.result_dir, exist_ok=True)
@@ -367,18 +444,13 @@ class BagRecorder(Node):
         self.write_params()
 
         topics_to_monitor = self.get_topics_to_monitor()
-        published_topics = [t[0] for t in topics_to_monitor]
 
-        topic_matcher = re.compile(f"({'|'.join([t[0] for t in topics_to_monitor])})$")
-
+        # Each entry is [full_topic_name, file_id, msg_type]
         topics_to_sub = []
-        for topic_name in published_topics:
-            match = re.search(topic_matcher, topic_name)
-            if not match:
+        for full_topic_name, _ in topics_to_monitor:
+            if (topic_class := self.get_class_for_topic_name(full_topic_name)) is None:
                 continue
-            # Append a list: [full_topic_name, topic_id, topic_type]
-            if (topic_class := self.get_class_for_topic_name(topic_name)) is not None:
-                topics_to_sub.append([topic_name, topic_name, topic_class[1]])
+            topics_to_sub.append([full_topic_name, topic_class[0], topic_class[1]])
 
         self.data_collectors = []
 
@@ -390,9 +462,27 @@ class BagRecorder(Node):
             collector = DataCollector(topic, unique_name)
             self.data_collectors.append(collector)
 
-        # Write extra information as needed (episode and start_goal can be recorded as parameters or in a separate bag topic)
+        # CSV mirrors (keeps compatibility with arena_evaluation/scripts/metrics.py)
+        for topic in topics_to_sub:
+            self.write_data(topic[1], ["time", "data"], mode="w")
+        self.write_data("episode", ["time", "episode"], mode="w")
+        self.write_data("start_goal", ["episode", "start", "goal"], mode="w")
+
+        self.config = self.read_config()
+
+        # Track episode + start/goal so metrics can attribute data correctly.
+        self._start_pose = None
+        self._goal_pose = None
+
+        goal_topic = str(self.get_parameter("goal_topic").value)
+        self.create_subscription(PoseStamped, goal_topic, self._goal_callback, 10)
+
         self.current_episode = 0
         self.current_time = None
+        self._last_seen_clock_time = None
+        self._last_clock_advance_wall_ns = None
+        self._last_record_wall_ns = None
+        self._record_period_ns = max(1, int(self.config["record_frequency"] * 1e6))
 
         # --- Setup rosbag2 writer ---
 
@@ -403,22 +493,24 @@ class BagRecorder(Node):
             output_serialization_format='cdr'
         )
         self.writer = SequentialWriter()
-        self.writer.open(storage_options, converter_options)
-        # Create topic metadata for each topic that will be recorded.
         self.topics_metadata = {}
-        for topic in topics_to_sub:
-            topic_name = topic[0]
-            msg_type = topic[2]
-            # Construct the type string. This follows the convention "package/msg/MessageType"
-            type_str = f"{os.path.dirname(msg_type.__module__.replace('.', '/'))}/{msg_type.__name__}"
-            metadata = TopicMetadata(
-                name=topic_name.strip('/'),
-                type=type_str,
-                serialization_format='cdr',
-                offered_qos_profiles=''
+        try:
+            self.writer.open(storage_options, converter_options)
+        except BaseException as exc:
+            self.get_logger().warn(
+                f"Failed to initialize rosbag storage '{storage_options.storage_id}': {exc}. Continuing with CSV-only recording."
             )
-            self.writer.create_topic(metadata)
-            self.topics_metadata[topic_name] = metadata
+            self.writer = None
+        else:
+            # Create topic metadata for each topic that will be recorded.
+            for topic in topics_to_sub:
+                topic_name = topic[0]
+                msg_type = topic[2]
+                # Construct the type string. This follows the convention "package/msg/MessageType"
+                type_str = f"{os.path.dirname(msg_type.__module__.replace('.', '/'))}/{msg_type.__name__}"
+                metadata = create_topic_metadata(topic_name, type_str)
+                self.writer.create_topic(metadata)
+                self.topics_metadata[topic_name] = metadata
 
         # Setup QoS for clock and scenario reset subscriptions
         self.qos = QoSProfile(
@@ -434,11 +526,12 @@ class BagRecorder(Node):
             self.qos
         )
 
+        scenario_reset_topic = str(self.get_parameter("scenario_reset_topic").value)
         self.scenario_reset_sub = self.create_subscription(
             Int16,
-            "/scenario_reset",
+            scenario_reset_topic,
             self.scenario_reset_callback,
-            self.qos
+            self.qos,
         )
 
         self.change_directory_service = self.create_service(
@@ -448,6 +541,77 @@ class BagRecorder(Node):
         )
 
         self.get_logger().info(f"Started recording to rosbag at: {bag_uri}")
+
+    def write_data(self, file_name, data, mode="a"):
+        with open(f"{self.result_dir}/{file_name}.csv", mode, newline="") as file:
+            writer = csv.writer(file, delimiter=",")
+            writer.writerow(data)
+            file.close()
+
+    def _goal_callback(self, msg: PoseStamped) -> None:
+        q = msg.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._goal_pose = [
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(yaw),
+        ]
+
+    def _odom_start_from_collectors(self):
+        for collector in self.data_collectors:
+            name, data = collector.get_data()
+            if name == "odom" and isinstance(data, dict) and "position" in data:
+                return data["position"]
+        return None
+
+    def _record_snapshot(self, *, bag_time_ns: int, csv_time: int) -> None:
+        self._last_record_wall_ns = time.monotonic_ns()
+
+        for collector in self.data_collectors:
+            topic_name, msg = collector.get_bag_message()
+            if msg is None:
+                continue
+            if self.writer is not None:
+                try:
+                    serialized_msg = serialize_message(msg)
+                    self.writer.write(topic_name.strip('/'), serialized_msg, bag_time_ns)
+                except BaseException as e:
+                    self.get_logger().error(f"Error writing message on topic {topic_name}: {e}")
+
+        for collector in self.data_collectors:
+            file_id, data = collector.get_data()
+            self.write_data(file_id, [csv_time, data])
+
+        self.write_data("episode", [csv_time, self.current_episode])
+        start_pose = self._start_pose
+        if start_pose is None:
+            start_pose = self.get_parameter('start').value
+        goal_pose = self._goal_pose
+        if goal_pose is None:
+            goal_pose = self.get_parameter('goal').value
+        self.write_data("start_goal", [self.current_episode, start_pose, goal_pose])
+
+    def _wall_clock_callback(self) -> None:
+        if self._last_seen_clock_time is None:
+            return
+
+        now_wall_ns = time.monotonic_ns()
+        if self._last_record_wall_ns is not None and now_wall_ns - self._last_record_wall_ns < self._record_period_ns:
+            return
+
+        if (
+            self._last_clock_advance_wall_ns is not None
+            and now_wall_ns - self._last_clock_advance_wall_ns <= self._record_period_ns * 2
+        ):
+            return
+
+        sim_time_ns = int(self._last_seen_clock_time)
+        sec = sim_time_ns // int(1e9)
+        nanosec = sim_time_ns % int(1e9)
+        self._record_snapshot(
+            bag_time_ns=sim_time_ns,
+            csv_time=sec * int(1e10) + nanosec,
+        )
 
     def get_directory(self, directory: str) -> str:
         AUTO_PREFIX = "auto:/"
@@ -515,36 +679,44 @@ class BagRecorder(Node):
         #     return ["pedsim_agents_data", pedsim_msgs.PedsimAgentsDataframe]
 
     def clock_callback(self, clock: Clock):
+        # Use nanoseconds for rosbag timestamps.
         current_simulation_action_time = clock.clock.sec * int(1e9) + clock.clock.nanosec
+        now_wall_ns = time.monotonic_ns()
+        if current_simulation_action_time != self._last_seen_clock_time:
+            self._last_seen_clock_time = current_simulation_action_time
+            self._last_clock_advance_wall_ns = now_wall_ns
         if self.current_time is None:
             self.current_time = current_simulation_action_time
 
         # Record at the configured frequency (in ms) from the configuration file
         time_diff = (current_simulation_action_time - self.current_time) / 1e6  # in ms
+        wall_time_diff = float("inf")
+        if self._last_record_wall_ns is not None:
+            wall_time_diff = (now_wall_ns - self._last_record_wall_ns) / 1e6
         # Read record frequency from config (assuming key "record_frequency" exists)
         if not hasattr(self, 'config'):
             self.config = self.read_config()
-        if time_diff < self.config["record_frequency"]:
+        if time_diff < self.config["record_frequency"] and wall_time_diff < self.config["record_frequency"]:
             return
 
-        self.current_time = current_simulation_action_time
+        if time_diff >= self.config["record_frequency"]:
+            self.current_time = current_simulation_action_time
+            csv_time = clock.clock.sec * int(1e10) + clock.clock.nanosec
+            self._record_snapshot(bag_time_ns=self.current_time, csv_time=csv_time)
+            return
 
-        # For each DataCollector, retrieve the last message and record it into the rosbag.
-        for collector in self.data_collectors:
-            topic_name = collector.full_topic_name
-            msg = collector.msg
-            # self.get_logger().warn(f"collected {topic_name}: {msg}")
-
-            if msg is None:
-                continue
-            try:
-                serialized_msg = serialize_message(msg)
-                self.writer.write(topic_name.strip('/'), serialized_msg, self.current_time)
-            except BaseException as e:
-                self.get_logger().error(f"Error writing message on topic {topic_name}: {e}")
+        sim_time_ns = int(self._last_seen_clock_time or current_simulation_action_time)
+        sec = sim_time_ns // int(1e9)
+        nanosec = sim_time_ns % int(1e9)
+        self._record_snapshot(
+            bag_time_ns=sim_time_ns,
+            csv_time=sec * int(1e10) + nanosec,
+        )
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
+        # Capture the start pose at the beginning of each episode (best-effort).
+        self._start_pose = self._odom_start_from_collectors() or self._start_pose
 
     def change_directory_callback(self, request, response):
         new_directory = request.data

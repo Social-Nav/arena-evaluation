@@ -8,7 +8,7 @@ package_name = 'arena_evaluation'
 setup(
     name=package_name,
     version='1.0.0',
-    packages=[package_name],
+    packages=find_packages(include=[package_name, f'{package_name}.*']),
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
@@ -21,7 +21,6 @@ setup(
     maintainer_email='trannamtruong98@gmail.com',
     description='Record, evaluate, and plot navigational metrics to evaluate ROS navigation planners',
     license='BSD',
-    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
         'record = arena_evaluation.data_recorder_node:main',

@@ -9,6 +9,7 @@ import os
 import yaml
 import enum
 import json
+import ast
 import typing
 import pandas as pd
 import numpy as np
@@ -169,14 +170,26 @@ class Metrics:
     dir: str
     _episode_data: typing.Dict[int, Metric]
 
+    @staticmethod
+    def _parse_optional_literal(value: str):
+        if not value:
+            return None
+        return ast.literal_eval(value)
+
+    @staticmethod
+    def _parse_optional_float_array(value: str) -> np.ndarray:
+        if not value:
+            return np.array([])
+        return Utils.string_to_float_list(value)
+
     def _load_data(self) -> typing.List[pd.DataFrame]:
 
         odom = pd.read_csv(os.path.join(self.dir, "odom.csv"), converters={
-            "data": lambda col: json.loads(col.replace("'", "\""))
+            "data": self._parse_optional_literal
         }).rename(columns={"data": "odom"})
 
         laserscan = pd.read_csv(os.path.join(self.dir, "scan.csv"), converters={
-            "data": Utils.string_to_float_list
+            "data": self._parse_optional_float_array
         }).rename(columns={"data": "laserscan"})
 
         episode = pd.read_csv(os.path.join(self.dir, "episode.csv"), converters={
@@ -208,6 +221,7 @@ class Metrics:
 
         data = pd.concat(self._load_data(), axis=1, join="inner")
         data = data.loc[:, ~data.columns.duplicated()].copy()
+        data = data.dropna(subset=["odom"]).copy()
 
         i = 0
 
@@ -224,14 +238,19 @@ class Metrics:
 
     @property
     def data(self) -> pd.DataFrame:
-        return pd.DataFrame.from_dict(self._episode_data).transpose().set_index("episode")
+        data = pd.DataFrame.from_dict(self._episode_data).transpose()
+        if data.empty:
+            return pd.DataFrame(index=pd.Index([], name="episode"))
+        if "episode" not in data.columns:
+            return data
+        return data.set_index("episode")
 
     def _analyze_episode(self, episode: pd.DataFrame, index) -> Metric:
 
         episode["time"] /= 10**10
 
         positions = np.array([frame["position"] for frame in episode["odom"]])
-        velocities = np.array([frame["position"] for frame in episode["odom"]])
+        velocities = np.array([frame["velocity"] for frame in episode["odom"]])
 
         curvature, normalized_curvature = Math.curvature(positions)
         roughness = Math.roughness(positions)
@@ -255,6 +274,10 @@ class Metrics:
 
         # print("PATH LENGTH", path_length, path_length_per_step)
 
+        final_distance = float('inf')
+        if len(positions) > 0 and len(goal_position) >= 2:
+            final_distance = float(np.linalg.norm(positions[-1, :2] - np.array(goal_position[:2], dtype=float)))
+
         return Metric(
             curvature=Math.round_values(curvature),
             normalized_curvature=Math.round_values(normalized_curvature),
@@ -272,7 +295,7 @@ class Metrics:
             time_diff=time,  # Ros time in ns
             time=list(map(int, episode["time"].tolist())),
             episode=index,
-            result=self._get_success(time, collision_amount),
+            result=self._get_success(time, collision_amount, final_distance),
             #            cmd_vel = list(map(list, episode["cmd_vel"].to_list())),
             goal=goal_position,
             start=start_position
@@ -280,36 +303,46 @@ class Metrics:
 
     def _get_robot_params(self):
 
-        # print("Current working directory:", os.getcwd())
-
         with open(os.path.join(self.dir, "params.yaml")) as file:
+            content = yaml.safe_load(file) or {}
 
-            content = yaml.safe_load(file)
+        model = (content.get("model") or "").strip()
+        namespace = (content.get("namespace") or "").strip("/")
+        if not model and namespace:
+            model = namespace.split("/")[-1]
 
-            model = content["model"]
+        candidate_paths = []
+        if model:
+            candidate_paths.append(
+                os.path.join(
+                    get_package_share_directory("arena_robots"),
+                    "robots",
+                    model,
+                    "model_params.yaml"
+                )
+            )
 
-        # robot_model_params_file = os.path.join(
-        #     get_package_share_directory(
-        #         "arena_simulation_setup"),
-        #         "entities",
-        #         "robots",
-        #         model,
-        #         "model_params.yaml"
-        # )
-
-        robot_model_params_file = os.path.join(
-            get_package_share_directory(
-                "arena_simulation_setup"),
-            "entities",
-            "robots",
-            "waffle",
-            "model_params.yaml"
+        candidate_paths.append(
+            os.path.join(
+                get_package_share_directory("arena_simulation_setup"),
+                "configs",
+                "nav2",
+                "defaults",
+                "model_params.yaml"
+            )
         )
+
+        robot_model_params_file = next((path for path in candidate_paths if os.path.exists(path)), None)
+        if robot_model_params_file is None:
+            raise FileNotFoundError(
+                f"Could not resolve robot model_params.yaml for model='{model}' namespace='{namespace}'"
+            )
 
         with open(robot_model_params_file, "r") as file:
             robot_model_param = yaml.safe_load(file)
-            nested = robot_model_param['/**']['ros__parameters']
-            return nested
+            if '/**' in robot_model_param and 'ros__parameters' in robot_model_param['/**']:
+                return robot_model_param['/**']['ros__parameters']
+            return robot_model_param
 
     def _get_mean_position(self, episode, key):
 
@@ -321,17 +354,28 @@ class Metrics:
 
             counter[hash] = counter.get(hash, 0) + 1
 
-        sorted_positions = dict(sorted(counter.items(), key=lambda x: x))
+        if not counter:
+            return [0.0, 0.0, 0.0]
 
-        return [float(r) for r in list(sorted_positions.keys())[0].split(":")]
+        def score(item):
+            key, count = item
+            values = [float(r) for r in key.split(":")]
+            is_zero_pose = len(values) >= 2 and abs(values[0]) < 1e-9 and abs(values[1]) < 1e-9
+            return (0 if is_zero_pose else 1, count)
 
-    def _get_success(self, time, collisions):
+        best_key, _ = max(counter.items(), key=score)
+        return [float(r) for r in best_key.split(":")]
+
+    def _get_success(self, time, collisions, final_distance=float('inf')):
 
         if time >= Config.TIMEOUT_TRESHOLD:
             return DoneReason.TIMEOUT
 
         if collisions >= Config.MAX_COLLISIONS:
             return DoneReason.COLLISION
+
+        if final_distance > 0.5:
+            return DoneReason.TIMEOUT
 
         return DoneReason.GOAL_REACHED
 
