@@ -456,6 +456,7 @@ class BagRecorder(Node):
 
         self.declare_parameter('start', [0.0, 0.0, 0.0])
         self.declare_parameter('goal', [0.0, 0.0, 0.0])
+        self.declare_parameter('start_topic', 'episode_start_pose')
         for topic in topics_to_sub:
             topic_name = topic[0]
             unique_name = topic_name.replace('/', '_')
@@ -474,8 +475,15 @@ class BagRecorder(Node):
         self._start_pose = None
         self._goal_pose = None
 
+        start_topic = str(self.get_parameter("start_topic").value)
         goal_topic = str(self.get_parameter("goal_topic").value)
-        self.create_subscription(PoseStamped, goal_topic, self._goal_callback, 10)
+        goal_qos = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.create_subscription(PoseStamped, start_topic, self._start_callback, goal_qos)
+        self.create_subscription(PoseStamped, goal_topic, self._goal_callback, goal_qos)
 
         self.current_episode = 0
         self.current_time = None
@@ -547,6 +555,15 @@ class BagRecorder(Node):
             writer = csv.writer(file, delimiter=",")
             writer.writerow(data)
             file.close()
+
+    def _start_callback(self, msg: PoseStamped) -> None:
+        q = msg.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self._start_pose = [
+            float(msg.pose.position.x),
+            float(msg.pose.position.y),
+            float(yaw),
+        ]
 
     def _goal_callback(self, msg: PoseStamped) -> None:
         q = msg.pose.orientation
