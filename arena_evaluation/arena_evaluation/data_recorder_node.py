@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+import json
 import math
 import os
 import re
@@ -98,7 +99,8 @@ class DataCollector(Node):
         topic_callbacks = [
             ("scan", self.laserscan_callback),
             ("odom", self.odometry_callback),
-            ("cmd_vel", self.action_callback)
+            ("cmd_vel", self.action_callback),
+            ("human_states", self.human_states_callback),
             # ("pedsim_agents_data", self.pedsim_callback)
         ]
 
@@ -172,11 +174,68 @@ class DataCollector(Node):
             round(msg_action.angular.z, 3)
         ]
 
+    def human_states_callback(self, msg_agents: Agents):
+        """Serialize HuNav Agents into a stable CSV-friendly structure.
+
+        The rosbag writer keeps the original message.  The CSV mirror is used by
+        offline social-navigation metrics, so keep it parseable without ROS
+        message definitions.
+        """
+
+        agents = []
+        for agent in getattr(msg_agents, 'agents', []):
+            pose = getattr(agent, 'position', None)
+            position = getattr(pose, 'position', None)
+            orientation = getattr(pose, 'orientation', None)
+            velocity = getattr(agent, 'velocity', None)
+            linear = getattr(velocity, 'linear', None)
+            angular = getattr(velocity, 'angular', None)
+            yaw = float(getattr(agent, 'yaw', 0.0))
+            if orientation is not None:
+                try:
+                    _, _, yaw = euler_from_quaternion([
+                        orientation.x,
+                        orientation.y,
+                        orientation.z,
+                        orientation.w,
+                    ])
+                except Exception:
+                    yaw = float(getattr(agent, 'yaw', 0.0))
+
+            agents.append({
+                "id": int(getattr(agent, 'id', 0)),
+                "name": str(getattr(agent, 'name', '')),
+                "type": int(getattr(agent, 'type', 0)),
+                "group_id": int(getattr(agent, 'group_id', 0)),
+                "position": [
+                    round(float(getattr(position, 'x', 0.0)), 3),
+                    round(float(getattr(position, 'y', 0.0)), 3),
+                    round(float(yaw), 3),
+                ],
+                "velocity": [
+                    round(float(getattr(linear, 'x', 0.0)), 3),
+                    round(float(getattr(linear, 'y', 0.0)), 3),
+                    round(float(getattr(angular, 'z', 0.0)), 3),
+                ],
+                "radius": round(float(getattr(agent, 'radius', 0.0)), 3),
+                "desired_velocity": round(float(getattr(agent, 'desired_velocity', 0.0)), 3),
+                "behavior_state": int(getattr(getattr(agent, 'behavior', None), 'state', 0)),
+            })
+
+        # Store as JSON to avoid ambiguity in nested CSV values.  Downstream
+        # parsers accept both JSON and legacy Python literal values.
+        self.data = json.dumps(agents, separators=(',', ':'))
+
     def get_data(self):
         return (
             self.full_topic_name,
             self.data
         )
+
+    def reset_data(self):
+        """Drop pre-reset samples so CSV rows start with fresh episode data."""
+        self.msg = None
+        self.data = None
 
     def get_bag_message(self):
         return (
@@ -265,6 +324,7 @@ class Recorder(Node):
         self.config = self.read_config()
 
         self.current_episode = 0
+        self._recording_started = False
         self.current_time = None
         self._last_seen_clock_time = None
         self._last_clock_advance_wall_ns = None
@@ -411,6 +471,8 @@ class Recorder(Node):
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
+        for collector in self.data_collectors:
+            collector.reset_data()
 
     def change_directory_callback(self, request, response):  # ROS2: Change parameters and update configurations on the fly without needing to restart the node
         new_directory = request.data
@@ -433,8 +495,10 @@ class BagRecorder(Node):
         self.declare_parameter("world", "")
         self.world = self.get_parameter("world").value
 
-        # Topic overrides (needed because task_generator publishes task_reset under its fully-qualified name)
+        # Topic overrides (needed because task_generator publishes some event/human topics
+        # under its fully-qualified name rather than the robot namespace).
         self.declare_parameter("scenario_reset_topic", "/scenario_reset")
+        self.declare_parameter("human_states_topic", "")
         self.declare_parameter("goal_topic", "goal_pose")
 
         self.base_dir = get_package_share_directory("arena_evaluation")
@@ -486,6 +550,8 @@ class BagRecorder(Node):
         self.create_subscription(PoseStamped, goal_topic, self._goal_callback, goal_qos)
 
         self.current_episode = 0
+        self._recording_started = False
+        self._recording_start_wall_ns = None
         self.current_time = None
         self._last_seen_clock_time = None
         self._last_clock_advance_wall_ns = None
@@ -534,12 +600,17 @@ class BagRecorder(Node):
             self.qos
         )
 
+        scenario_reset_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
         scenario_reset_topic = str(self.get_parameter("scenario_reset_topic").value)
         self.scenario_reset_sub = self.create_subscription(
             Int16,
             scenario_reset_topic,
             self.scenario_reset_callback,
-            self.qos,
+            scenario_reset_qos,
         )
 
         self.change_directory_service = self.create_service(
@@ -582,6 +653,9 @@ class BagRecorder(Node):
         return None
 
     def _record_snapshot(self, *, bag_time_ns: int, csv_time: int) -> None:
+        if not self._recording_started:
+            return
+
         self._last_record_wall_ns = time.monotonic_ns()
 
         for collector in self.data_collectors:
@@ -609,10 +683,23 @@ class BagRecorder(Node):
         self.write_data("start_goal", [self.current_episode, start_pose, goal_pose])
 
     def _wall_clock_callback(self) -> None:
-        if self._last_seen_clock_time is None:
+        if not self._recording_started:
             return
 
         now_wall_ns = time.monotonic_ns()
+        if self._last_seen_clock_time is None:
+            start_wall_ns = self._recording_start_wall_ns or now_wall_ns
+            if self._last_record_wall_ns is not None and now_wall_ns - self._last_record_wall_ns < self._record_period_ns:
+                return
+            elapsed_ns = max(0, now_wall_ns - start_wall_ns)
+            sec = elapsed_ns // int(1e9)
+            nanosec = elapsed_ns % int(1e9)
+            self._record_snapshot(
+                bag_time_ns=elapsed_ns,
+                csv_time=sec * int(1e10) + nanosec,
+            )
+            return
+
         if self._last_record_wall_ns is not None and now_wall_ns - self._last_record_wall_ns < self._record_period_ns:
             return
 
@@ -673,12 +760,22 @@ class BagRecorder(Node):
 
     def get_topics_to_monitor(self):
         namespace = self.get_namespace()
+        human_states_topic = str(self.get_parameter("human_states_topic").value or "")
+        if not human_states_topic:
+            # Recorder nodes are pushed into the robot namespace
+            # (e.g. /task_generator_node/Ai2_Bot2), while HuNav publishes the
+            # shared human state stream at the task-generator namespace
+            # (/task_generator_node/human_states).  Fall back to the parent
+            # namespace so existing launches record social-navigation humans.
+            parts = namespace.rstrip('/').split('/')
+            parent_namespace = '/'.join(parts[:-1]) if len(parts) > 1 else namespace.rstrip('/')
+            human_states_topic = f"{parent_namespace}/human_states" if parent_namespace else "/human_states"
         return [
             (f"{namespace}/scan", LaserScan),
             (f"{namespace}/scenario_reset", Int16),
             (f"{namespace}/odom", Odometry),
             (f"{namespace}/cmd_vel", Twist),
-            (f"{namespace}/human_states", Agents),
+            (human_states_topic, Agents),
         ]
 
     def get_class_for_topic_name(self, topic_name: str):
@@ -732,8 +829,15 @@ class BagRecorder(Node):
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
+        start_pose = self._odom_start_from_collectors()
+        self._recording_started = True
+        self._recording_start_wall_ns = time.monotonic_ns()
+        self.current_time = None
+        self._last_record_wall_ns = None
+        for collector in self.data_collectors:
+            collector.reset_data()
         # Capture the start pose at the beginning of each episode (best-effort).
-        self._start_pose = self._odom_start_from_collectors() or self._start_pose
+        self._start_pose = start_pose or self._start_pose
 
     def change_directory_callback(self, request, response):
         new_directory = request.data
