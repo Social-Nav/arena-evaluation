@@ -233,7 +233,17 @@ class DataCollector(Node):
         )
 
     def reset_data(self):
-        """Drop pre-reset samples so CSV rows start with fresh episode data."""
+        """Drop pre-reset samples so CSV rows start with fresh episode data.
+
+        HuNav human states are intentionally retained across the reset edge.  In
+        Isaac-backed social evals the readiness gate observes a non-empty
+        ``/human_states`` message before publishing ``task_reset``; HuNav may not
+        publish another Agents sample during a short episode.  Clearing this
+        collector on reset therefore creates empty ``human_states.csv`` rows even
+        though pedestrians are already spawned and visible from video t=0.
+        """
+        if self.full_topic_name == "human_states" and self.data not in (None, "", []):
+            return
         self.msg = None
         self.data = None
 
@@ -602,7 +612,11 @@ class BagRecorder(Node):
 
         scenario_reset_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
-            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            # The recorder node is launched before the reset for eval runs.  Do
+            # not replay a latched task_reset from a previous run, otherwise CSV
+            # recording can start during world/robot/pedestrian loading and
+            # contaminate episode metrics with pre-reset samples.
+            durability=QoSDurabilityPolicy.VOLATILE,
             depth=1,
         )
         scenario_reset_topic = str(self.get_parameter("scenario_reset_topic").value)
