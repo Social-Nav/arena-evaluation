@@ -61,7 +61,7 @@ class Metric(typing.TypedDict):
     acceleration: typing.List
     jerk: typing.List
 
-    collision_amount: int
+    collision_amount: typing.Optional[int]
     collisions: typing.List
 
 #    action_type: typing.List[Action]
@@ -268,13 +268,15 @@ class Metrics:
 #            "data": Utils.string_to_float_list
 #        }).rename(columns={"data": "cmd_vel"})
 
-        return [
+        data_frames = [
             episode,
-            laserscan,
             odom,
             #            cmd_vel,
             start_goal
         ]
+        if not laserscan.empty:
+            data_frames.insert(1, laserscan)
+        return data_frames
 
     def __init__(self, dir: str):
 
@@ -316,10 +318,16 @@ class Metrics:
         acceleration = Math.acceleration(vel_absolute)
         jerk = Math.jerk(vel_absolute)
 
-        collisions, collision_amount = self._get_collisions(
-            episode["laserscan"],
-            self.robot_params["robot_radius"]
-        )
+        if "laserscan" in episode.columns:
+            collisions, collision_amount = self._get_collisions(
+                episode["laserscan"],
+                self.robot_params["robot_radius"]
+            )
+        else:
+            # Some visual-navigation robots do not publish LaserScan. Do not
+            # synthesize scan data; mark collision metrics as unavailable while
+            # still emitting odometry/path metrics for the episode.
+            collisions, collision_amount = [], None
 
         path_length = Math.path_length(positions)
         turn = Math.turn(positions[:, 2])
@@ -461,7 +469,7 @@ class Metrics:
         if time >= Config.TIMEOUT_TRESHOLD:
             return DoneReason.TIMEOUT
 
-        if collisions >= Config.MAX_COLLISIONS:
+        if collisions is not None and collisions >= Config.MAX_COLLISIONS:
             return DoneReason.COLLISION
 
         return DoneReason.GOAL_REACHED

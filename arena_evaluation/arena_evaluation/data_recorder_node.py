@@ -5,6 +5,7 @@ import csv
 import math
 import os
 import re
+import time
 import traceback
 from datetime import datetime
 
@@ -14,6 +15,8 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Twist
 from hunav_msgs.msg import Agents
 from nav_msgs.msg import Odometry
+from rclpy.clock import Clock as RclpyClock
+from rclpy.clock_type import ClockType
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
@@ -263,6 +266,10 @@ class Recorder(Node):
         self.write_data("start_goal", ["episode", "start", "goal"], mode="w")
 
         self.config = self.read_config()
+        self._record_period_sec = max(float(self.config.get("record_frequency", 400)) / 1000.0, 0.05)
+        self._last_clock_progress_wall_time = 0.0
+        self._last_clock_sim_time = None
+        self._last_record_wall_time = 0.0
 
         self.current_episode = 0
         self.current_time = None
@@ -285,6 +292,11 @@ class Recorder(Node):
             "/scenario_reset",
             self.scenario_reset_callback,
             self.qos
+        )
+        self.wall_clock_timer = self.create_timer(
+            self._record_period_sec,
+            self.wall_clock_fallback_callback,
+            clock=RclpyClock(clock_type=ClockType.STEADY_TIME),
         )
 
         # Define the service for changing directory
@@ -380,10 +392,28 @@ class Recorder(Node):
             return yaml.safe_load(file)
 
     def clock_callback(self, clock: Clock):
+        current_simulation_action_time = int(clock.clock.sec * 10_000_000_000 + clock.clock.nanosec)
 
-        current_simulation_action_time = clock.clock.sec * 10e9 + clock.clock.nanosec
+        if self._last_clock_sim_time != current_simulation_action_time:
+            self._last_clock_sim_time = current_simulation_action_time
+            self._last_clock_progress_wall_time = time.monotonic()
 
-        if not self.current_time:
+        self._record_tick(current_simulation_action_time)
+
+    def wall_clock_fallback_callback(self):
+        if self._last_clock_sim_time is None or self.current_time is None:
+            return
+        if self._last_record_wall_time and time.monotonic() - self._last_record_wall_time < self._record_period_sec * 2.0:
+            return
+        step_ns = int(float(self.config["record_frequency"]) * 1_000_000)
+        synthetic_time = self.current_time + step_ns
+        self._record_tick(synthetic_time)
+
+    def _record_tick(self, current_simulation_action_time):
+
+        if self.current_time is None:
+            self.current_time = current_simulation_action_time
+        elif current_simulation_action_time < self.current_time:
             self.current_time = current_simulation_action_time
 
         time_diff = (current_simulation_action_time - self.current_time) / 1e6  # in ms
@@ -392,6 +422,7 @@ class Recorder(Node):
             return
 
         self.current_time = current_simulation_action_time
+        self._last_record_wall_time = time.monotonic()
 
         for collector in self.data_collectors:
 
@@ -524,12 +555,23 @@ class BagRecorder(Node):
             msg_type = topic[2]
             # Construct the type string. This follows the convention "package/msg/MessageType"
             type_str = f"{os.path.dirname(msg_type.__module__.replace('.', '/'))}/{msg_type.__name__}"
-            metadata = TopicMetadata(
-                name=topic_name.strip('/'),
-                type=type_str,
-                serialization_format='cdr',
-                offered_qos_profiles=''
-            )
+            topic_metadata_kwargs = {
+                'name': topic_name.strip('/'),
+                'type': type_str,
+                'serialization_format': 'cdr',
+            }
+            try:
+                metadata = TopicMetadata(
+                    **topic_metadata_kwargs,
+                    offered_qos_profiles='',
+                )
+            except TypeError:
+                # ROS 2 Jazzy rosbag2_py expects an explicit topic id and a QoS list.
+                metadata = TopicMetadata(
+                    id=len(self.topics_metadata) + 1,
+                    **topic_metadata_kwargs,
+                    offered_qos_profiles=[],
+                )
             self.writer.create_topic(metadata)
             self.topics_metadata[topic_name] = metadata
 
@@ -552,6 +594,16 @@ class BagRecorder(Node):
             "/scenario_reset",
             self.scenario_reset_callback,
             self.qos
+        )
+        self.config = self.read_config()
+        self._record_period_sec = max(float(self.config.get("record_frequency", 400)) / 1000.0, 0.05)
+        self._last_clock_progress_wall_time = 0.0
+        self._last_clock_sim_time = None
+        self._last_record_wall_time = 0.0
+        self.wall_clock_timer = self.create_timer(
+            self._record_period_sec,
+            self.wall_clock_fallback_callback,
+            clock=RclpyClock(clock_type=ClockType.STEADY_TIME),
         )
 
         self.change_directory_service = self.create_service(
@@ -656,18 +708,35 @@ class BagRecorder(Node):
         # Keep the same time scaling as Recorder to stay compatible with existing metrics converters.
         # NOTE: use an integer scale to keep timestamps as int for rosbag2 writer.
         current_simulation_action_time = clock.clock.sec * 10_000_000_000 + clock.clock.nanosec
+
+        if self._last_clock_sim_time != current_simulation_action_time:
+            self._last_clock_sim_time = current_simulation_action_time
+            self._last_clock_progress_wall_time = time.monotonic()
+
+        self._record_tick(current_simulation_action_time)
+
+    def wall_clock_fallback_callback(self):
+        if self._last_clock_sim_time is None or self.current_time is None:
+            return
+        if self._last_record_wall_time and time.monotonic() - self._last_record_wall_time < self._record_period_sec * 2.0:
+            return
+        step_ns = int(float(self.config["record_frequency"]) * 1_000_000)
+        synthetic_time = self.current_time + step_ns
+        self._record_tick(synthetic_time)
+
+    def _record_tick(self, current_simulation_action_time):
         if self.current_time is None:
+            self.current_time = current_simulation_action_time
+        elif current_simulation_action_time < self.current_time:
             self.current_time = current_simulation_action_time
 
         # Record at the configured frequency (in ms) from the configuration file
         time_diff = (current_simulation_action_time - self.current_time) / 1e6  # in ms
-        # Read record frequency from config (assuming key "record_frequency" exists)
-        if not hasattr(self, 'config'):
-            self.config = self.read_config()
         if time_diff < self.config["record_frequency"]:
             return
 
         self.current_time = current_simulation_action_time
+        self._last_record_wall_time = time.monotonic()
 
         # For each DataCollector, retrieve the last message and record it into the rosbag.
         for collector in self.data_collectors:

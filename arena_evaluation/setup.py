@@ -14,6 +14,9 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
         ("share/" + package_name, ["package.xml"]),
+        (os.path.join("share", package_name, "config"), [
+            "config/data_recorder_config.yaml",
+        ]),
     ],
     install_requires=["setuptools", "pyyaml", "bddl>=3.5.0"],
     zip_safe=True,
@@ -33,6 +36,8 @@ setup(
             "arena-eval = arena_evaluation.cli:main",
             "arena-episode-recorder = arena_evaluation.ros.episode_recorder_node:main",
             "arena-bddl-evaluator = arena_evaluation.ros.bddl_evaluator_node:main",
+            "record = arena_evaluation.data_recorder_node:main",
+            "metrics = arena_evaluation.get_metrics:main",
         ]
     },
 )
