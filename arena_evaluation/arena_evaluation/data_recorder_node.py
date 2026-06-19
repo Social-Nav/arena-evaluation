@@ -11,6 +11,7 @@ from datetime import datetime
 
 import rclpy
 import yaml
+from geometry_msgs.msg import PoseStamped
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import Twist
 from hunav_msgs.msg import Agents
@@ -33,6 +34,21 @@ from tf_transformations import euler_from_quaternion
 # from arena_evaluation.scripts.utils import Pedestrian
 # import pedsim_msgs.msg           as pedsim_msgs
 import arena_evaluation_msgs.srv as arena_evaluation_srvs
+
+
+def pose_stamped_to_xyyaw(msg: PoseStamped) -> list[float]:
+    pose = msg.pose
+    _, _, yaw = euler_from_quaternion([
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z,
+        pose.orientation.w,
+    ])
+    return [
+        round(pose.position.x, 3),
+        round(pose.position.y, 3),
+        round(yaw, 3),
+    ]
 
 
 class DataCollector(Node):
@@ -506,6 +522,11 @@ class BagRecorder(Node):
 
         self.declare_parameter('start', [0.0, 0.0, 0.0])
         self.declare_parameter('goal', [0.0, 0.0, 0.0])
+        self.declare_parameter('scenario_reset_topic', '/scenario_reset')
+        self.declare_parameter('start_topic', 'episode_start_pose')
+        self.declare_parameter('goal_topic', 'episode_goal_pose_metadata')
+        self.current_start = [0.0, 0.0, 0.0]
+        self.current_goal = [0.0, 0.0, 0.0]
         for topic in topics_to_sub:
             topic_name = topic[0]
             unique_name = topic_name.replace('/', '_')
@@ -522,11 +543,12 @@ class BagRecorder(Node):
                 self._csv_topic_to_file[topic_name] = "scan"
                 self.write_data("scan", ["time", "data"], mode="w")
             elif basename in ("human_states",):
-                # Keep legacy file name expected by PedsimMetrics.
+                # Keep legacy PedsimMetrics output and the benchmark artifact name in sync.
                 # If multiple human_states topics are configured (e.g. robot namespace + parent namespace),
                 # only export one of them to CSV to avoid duplicated rows.
                 if not human_csv_created:
-                    self._csv_topic_to_file[topic_name] = "pedsim_agents_data"
+                    self._csv_topic_to_file[topic_name] = ["human_states", "pedsim_agents_data"]
+                    self.write_data("human_states", ["time", "data"], mode="w")
                     self.write_data("pedsim_agents_data", ["time", "data"], mode="w")
                     human_csv_created = True
 
@@ -589,11 +611,29 @@ class BagRecorder(Node):
             self.qos
         )
 
+        scenario_reset_topic = str(self.get_parameter('scenario_reset_topic').value or '/scenario_reset')
         self.scenario_reset_sub = self.create_subscription(
             Int16,
-            "/scenario_reset",
+            self.resolve_topic_name(scenario_reset_topic),
             self.scenario_reset_callback,
             self.qos
+        )
+        pose_qos = QoSProfile(
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            depth=1,
+        )
+        self.start_sub = self.create_subscription(
+            PoseStamped,
+            self.resolve_topic_name(str(self.get_parameter('start_topic').value or 'episode_start_pose')),
+            self.start_callback,
+            pose_qos,
+        )
+        self.goal_sub = self.create_subscription(
+            PoseStamped,
+            self.resolve_topic_name(str(self.get_parameter('goal_topic').value or 'episode_goal_pose_metadata')),
+            self.goal_callback,
+            pose_qos,
         )
         self.config = self.read_config()
         self._record_period_sec = max(float(self.config.get("record_frequency", 400)) / 1000.0, 0.05)
@@ -755,18 +795,28 @@ class BagRecorder(Node):
             # Additionally export CSV for supported topics
             if topic_name in self._csv_topic_to_file:
                 _, data = collector.get_data()
-                self.write_data(self._csv_topic_to_file[topic_name], [self.current_time, data])
+                csv_targets = self._csv_topic_to_file[topic_name]
+                if isinstance(csv_targets, str):
+                    csv_targets = [csv_targets]
+                for csv_target in csv_targets:
+                    self.write_data(csv_target, [self.current_time, data])
 
         # Export episode and start/goal parameters in the same format as Recorder
         self.write_data("episode", [self.current_time, self.current_episode])
         self.write_data("start_goal", [
             self.current_episode,
-            self.get_parameter('start').value,
-            self.get_parameter('goal').value
+            self.current_start,
+            self.current_goal
         ])
 
     def scenario_reset_callback(self, data: Int16):
         self.current_episode = data.data
+
+    def start_callback(self, data: PoseStamped):
+        self.current_start = pose_stamped_to_xyyaw(data)
+
+    def goal_callback(self, data: PoseStamped):
+        self.current_goal = pose_stamped_to_xyyaw(data)
 
     def change_directory_callback(self, request, response):
         new_directory = request.data

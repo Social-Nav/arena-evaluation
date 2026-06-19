@@ -18,7 +18,7 @@ setup(
             "config/data_recorder_config.yaml",
         ]),
     ],
-    install_requires=["setuptools", "pyyaml", "bddl>=3.5.0"],
+    install_requires=["setuptools", "pyyaml", "pandas>=2,<3", "bddl>=3.5.0"],
     zip_safe=True,
     maintainer="Name",
     maintainer_email="your@email.com",
@@ -38,6 +38,7 @@ setup(
             "arena-bddl-evaluator = arena_evaluation.ros.bddl_evaluator_node:main",
             "record = arena_evaluation.data_recorder_node:main",
             "metrics = arena_evaluation.get_metrics:main",
+            "social_metrics = arena_evaluation.social_metrics:main",
         ]
     },
 )

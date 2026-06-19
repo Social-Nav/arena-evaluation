@@ -16,8 +16,9 @@
 
   <!-- Optional at runtime, but commonly present in Arena stacks -->
   <exec_depend>arena_people_msgs</exec_depend>
+  <exec_depend>python3-pandas</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>
   </export>
-</package>  
+</package>
