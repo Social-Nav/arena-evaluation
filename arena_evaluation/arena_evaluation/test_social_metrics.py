@@ -131,3 +131,95 @@ def test_social_metrics_fails_dynamic_scene_when_humans_are_static(tmp_path):
     assert result["human_motion_time_sec"] == 0.0
     assert result["human_robot_motion_overlap_time_sec"] == 0.0
     assert result["dynamic_scene_success"] is False
+
+
+def test_social_metrics_reports_strict_footprint_collision(tmp_path):
+    (tmp_path / "vln_task_metrics.json").write_text(
+        json.dumps(
+            {
+                "strict_task_success": True,
+                "strict_task_failure_reasons": [],
+                "static_occupancy": {"collision_sample_count": 0, "intervals": []},
+                "commanded_stuck": {"commanded_stuck_time_sec": 0.0, "commanded_stuck_intervals": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_rows(
+        tmp_path / "odom.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "{'position': [0.0, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+            {"time": "10000000000", "data": "{'position': [0.2, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+            {"time": "20000000000", "data": "{'position': [0.4, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+        ],
+    )
+    _write_rows(
+        tmp_path / "human_states.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "[{'id': '1', 'position': [0.4, 0.0]}]"},
+            {"time": "10000000000", "data": "[{'id': '1', 'position': [0.6, 0.0]}]"},
+            {"time": "20000000000", "data": "[{'id': '1', 'position': [0.8, 0.0]}]"},
+        ],
+    )
+
+    result = generate_social_metrics(
+        tmp_path,
+        thresholds={
+            "robot_radius_m": 0.3,
+            "human_radius_m": 0.25,
+            "min_human_motion_time_sec": 1.0,
+            "min_human_robot_motion_overlap_time_sec": 1.0,
+            "min_human_robot_interaction_time_sec": 1.0,
+        },
+    )
+
+    assert result["min_footprint_clearance_m"] < 0.0
+    assert result["footprint_human_collision_count"] >= 1
+    assert result["strict_social_success"] is False
+    assert "footprint_human_collision" in result["strict_social_failure_reasons"]
+
+
+def test_social_metrics_strict_failure_includes_task_failures(tmp_path):
+    (tmp_path / "vln_task_metrics.json").write_text(
+        json.dumps(
+            {
+                "strict_task_success": False,
+                "strict_task_failure_reasons": ["static_occupancy_collision"],
+                "static_occupancy": {"collision_sample_count": 3, "intervals": [{"start_sec": 1.0, "end_sec": 2.0}]},
+                "commanded_stuck": {"commanded_stuck_time_sec": 0.0, "commanded_stuck_intervals": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_rows(
+        tmp_path / "odom.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "{'position': [0.0, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+            {"time": "10000000000", "data": "{'position': [0.2, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+        ],
+    )
+    _write_rows(
+        tmp_path / "human_states.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "[{'id': '1', 'position': [2.0, 0.0]}]"},
+            {"time": "10000000000", "data": "[{'id': '1', 'position': [2.2, 0.0]}]"},
+        ],
+    )
+
+    result = generate_social_metrics(
+        tmp_path,
+        thresholds={
+            "min_human_motion_time_sec": 1.0,
+            "min_human_robot_motion_overlap_time_sec": 1.0,
+            "min_human_robot_interaction_time_sec": 1.0,
+        },
+    )
+
+    assert result["social_success"] is True
+    assert result["strict_social_success"] is False
+    assert "static_occupancy_collision" in result["strict_social_failure_reasons"]
+    assert result["review_intervals"]["static_occupancy"] == [{"start_sec": 1.0, "end_sec": 2.0}]

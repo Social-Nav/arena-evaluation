@@ -39,6 +39,7 @@ setup(
             "record = arena_evaluation.data_recorder_node:main",
             "metrics = arena_evaluation.get_metrics:main",
             "social_metrics = arena_evaluation.social_metrics:main",
+            "vln_task_metrics = arena_evaluation.vln_task_metrics:main",
         ]
     },
 )

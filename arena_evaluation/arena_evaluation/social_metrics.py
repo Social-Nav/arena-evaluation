@@ -17,6 +17,8 @@ DEFAULT_THRESHOLDS = {
     "personal_space_radius_m": 1.0,
     "near_miss_radius_m": 0.5,
     "human_collision_radius_m": 0.25,
+    "robot_radius_m": 0.30,
+    "human_radius_m": 0.25,
     "crowd_radius_m": 1.5,
     "crowd_freezing_speed_mps": 0.05,
     "large_teleport_threshold_m": 5.0,
@@ -295,6 +297,16 @@ def _read_base_metrics(run_dir: Path) -> dict[str, Any]:
     return {"rows": len(rows), "first": first}
 
 
+def _read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def generate_social_metrics(
     run_dir: str | os.PathLike[str],
     thresholds: dict[str, float] | None = None,
@@ -325,10 +337,19 @@ def generate_social_metrics(
     human_robot_interaction_time_sec = 0.0
     near_miss_count = 0
     human_collision_count = 0
+    footprint_personal_space_violation_time_sec = 0.0
+    footprint_near_miss_count = 0
+    footprint_human_collision_count = 0
+    min_footprint_clearance_m: float | None = None
     near_miss_active = False
     human_collision_active = False
+    footprint_near_miss_active = False
+    footprint_human_collision_active = False
     human_motion = _human_motion_summary(human_samples, cfg)
     human_motion_intervals = human_motion.pop("human_motion_intervals")
+    robot_radius = float(cfg.get("robot_radius_m", 0.0) or 0.0)
+    human_radius = float(cfg.get("human_radius_m", 0.0) or 0.0)
+    footprint_collision_threshold = robot_radius + human_radius
 
     for idx, odom in enumerate(odom_samples):
         human_sample = _nearest_human_sample(human_samples, odom["time"])
@@ -351,6 +372,9 @@ def generate_social_metrics(
 
         if min_human_distance_m is None or nearest < min_human_distance_m:
             min_human_distance_m = nearest
+        footprint_clearance = nearest - footprint_collision_threshold
+        if min_footprint_clearance_m is None or footprint_clearance < min_footprint_clearance_m:
+            min_footprint_clearance_m = footprint_clearance
 
         next_odom = odom_samples[idx + 1] if idx + 1 < len(odom_samples) else None
         dt = _dt_seconds(odom, next_odom)
@@ -375,6 +399,8 @@ def generate_social_metrics(
             personal_space_violation_time_sec += dt
             if odom["speed"] < cfg["crowd_freezing_speed_mps"]:
                 crowd_freezing_time_sec += dt
+        if footprint_clearance < cfg["personal_space_radius_m"]:
+            footprint_personal_space_violation_time_sec += dt
 
         in_near_miss = nearest < cfg["near_miss_radius_m"]
         if in_near_miss and not near_miss_active:
@@ -385,6 +411,16 @@ def generate_social_metrics(
         if in_human_collision and not human_collision_active:
             human_collision_count += 1
         human_collision_active = in_human_collision
+
+        in_footprint_near_miss = footprint_clearance < cfg["near_miss_radius_m"]
+        if in_footprint_near_miss and not footprint_near_miss_active:
+            footprint_near_miss_count += 1
+        footprint_near_miss_active = in_footprint_near_miss
+
+        in_footprint_human_collision = footprint_clearance < 0.0
+        if in_footprint_human_collision and not footprint_human_collision_active:
+            footprint_human_collision_count += 1
+        footprint_human_collision_active = in_footprint_human_collision
 
     humans_present = human_nonempty_samples > 0
     social_success = (
@@ -400,6 +436,30 @@ def generate_social_metrics(
         and human_robot_motion_overlap_time_sec >= cfg["min_human_robot_motion_overlap_time_sec"]
         and human_robot_interaction_time_sec >= cfg["min_human_robot_interaction_time_sec"]
     )
+    strict_task_metrics = _read_json(run_path / "vln_task_metrics.json")
+    strict_social_failure_reasons: list[str] = []
+    if not dynamic_scene_success:
+        strict_social_failure_reasons.append("dynamic_scene_failed")
+    if footprint_human_collision_count > 0:
+        strict_social_failure_reasons.append("footprint_human_collision")
+    if footprint_near_miss_count > 0:
+        strict_social_failure_reasons.append("footprint_near_miss")
+    if near_miss_count > 0:
+        strict_social_failure_reasons.append("point_near_miss")
+    if human_collision_count > 0:
+        strict_social_failure_reasons.append("point_human_collision")
+    if large_teleports:
+        strict_social_failure_reasons.append("large_teleport")
+    if strict_task_metrics:
+        static_occupancy = strict_task_metrics.get("static_occupancy") or {}
+        commanded_stuck = strict_task_metrics.get("commanded_stuck") or {}
+        if int(static_occupancy.get("collision_sample_count") or 0) > 0:
+            strict_social_failure_reasons.append("static_occupancy_collision")
+        if float(commanded_stuck.get("commanded_stuck_time_sec") or 0.0) > 0.0:
+            strict_social_failure_reasons.append("commanded_stuck")
+    else:
+        strict_social_failure_reasons.append("missing_vln_task_metrics")
+    strict_social_success = not strict_social_failure_reasons
 
     result = {
         "schema_version": 1,
@@ -419,9 +479,13 @@ def generate_social_metrics(
         "observed_human_ids": sorted(observed_ids),
         "path_length_m": path_length_m,
         "min_human_distance_m": min_human_distance_m,
+        "min_footprint_clearance_m": min_footprint_clearance_m,
         "personal_space_violation_time_sec": personal_space_violation_time_sec,
+        "footprint_personal_space_violation_time_sec": footprint_personal_space_violation_time_sec,
         "near_miss_count": near_miss_count,
         "human_collision_count": human_collision_count,
+        "footprint_near_miss_count": footprint_near_miss_count,
+        "footprint_human_collision_count": footprint_human_collision_count,
         "crowd_freezing_time_sec": crowd_freezing_time_sec,
         "robot_motion_time_sec": robot_motion_time_sec,
         "human_robot_motion_overlap_time_sec": human_robot_motion_overlap_time_sec,
@@ -430,6 +494,23 @@ def generate_social_metrics(
         **human_motion,
         "large_teleports": large_teleports,
         "social_success": social_success,
+        "strict_social_success": strict_social_success,
+        "strict_social_failure_reasons": strict_social_failure_reasons,
+        "strict_task_metrics_path": str(run_path / "vln_task_metrics.json") if strict_task_metrics else None,
+        "strict_task_success": strict_task_metrics.get("strict_task_success") if strict_task_metrics else None,
+        "strict_task_failure_reasons": strict_task_metrics.get("strict_task_failure_reasons") if strict_task_metrics else [],
+        "review_intervals": {
+            "commanded_stuck": (strict_task_metrics.get("commanded_stuck") or {}).get("commanded_stuck_intervals", [])
+            if strict_task_metrics
+            else [],
+            "static_occupancy": (strict_task_metrics.get("static_occupancy") or {}).get("intervals", [])
+            if strict_task_metrics
+            else [],
+        },
+        "video_paths": {
+            "sim_top_down": str(run_path / "videos" / "episode_0000" / "sim_top_down.mp4"),
+            "ego_debug_overlay": str(run_path / "videos" / "episode_0000" / "ego_debug_overlay.mp4"),
+        },
         "thresholds": cfg,
         "base_metrics": _read_base_metrics(run_path),
     }
