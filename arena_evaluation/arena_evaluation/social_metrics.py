@@ -423,7 +423,7 @@ def generate_social_metrics(
         footprint_human_collision_active = in_footprint_human_collision
 
     humans_present = human_nonempty_samples > 0
-    social_success = (
+    legacy_social_success = (
         humans_present
         and human_collision_count == 0
         and near_miss_count == 0
@@ -493,7 +493,8 @@ def generate_social_metrics(
         "dynamic_scene_success": dynamic_scene_success,
         **human_motion,
         "large_teleports": large_teleports,
-        "social_success": social_success,
+        "social_success": strict_social_success,
+        "legacy_social_success": legacy_social_success,
         "strict_social_success": strict_social_success,
         "strict_social_failure_reasons": strict_social_failure_reasons,
         "strict_task_metrics_path": str(run_path / "vln_task_metrics.json") if strict_task_metrics else None,
