@@ -255,6 +255,23 @@ def _intervals_overlap(intervals: list[tuple[int, int]], start: int, end: int) -
     return False
 
 
+def _event_sample(
+    *,
+    odom: dict[str, Any],
+    agent: dict[str, Any],
+    distance_m: float,
+    footprint_clearance_m: float,
+) -> dict[str, Any]:
+    return {
+        "time_sec": int(odom["time"]) / RECORDER_TIME_UNITS_PER_SECOND,
+        "robot_position": [float(odom["x"]), float(odom["y"])],
+        "human_id": str(agent.get("id", "")),
+        "human_position": [float(agent["x"]), float(agent["y"])],
+        "distance_m": float(distance_m),
+        "footprint_clearance_m": float(footprint_clearance_m),
+    }
+
+
 def _path_length_and_teleports(
     odom_samples: list[dict[str, Any]],
     threshold_m: float,
@@ -341,6 +358,12 @@ def generate_social_metrics(
     footprint_near_miss_count = 0
     footprint_human_collision_count = 0
     min_footprint_clearance_m: float | None = None
+    min_distance_sample: dict[str, Any] | None = None
+    min_footprint_clearance_sample: dict[str, Any] | None = None
+    footprint_near_miss_events: list[dict[str, Any]] = []
+    footprint_human_collision_events: list[dict[str, Any]] = []
+    point_near_miss_events: list[dict[str, Any]] = []
+    point_human_collision_events: list[dict[str, Any]] = []
     near_miss_active = False
     human_collision_active = False
     footprint_near_miss_active = False
@@ -362,19 +385,29 @@ def generate_social_metrics(
         human_nonempty_samples += 1
         max_humans_observed = max(max_humans_observed, len(agents))
         nearest = None
+        nearest_agent = None
         for agent in agents:
             observed_ids.add(str(agent["id"]))
             distance = math.hypot(agent["x"] - odom["x"], agent["y"] - odom["y"])
             if nearest is None or distance < nearest:
                 nearest = distance
+                nearest_agent = agent
         if nearest is None:
             continue
 
+        sample = _event_sample(
+            odom=odom,
+            agent=nearest_agent,
+            distance_m=nearest,
+            footprint_clearance_m=nearest - footprint_collision_threshold,
+        )
         if min_human_distance_m is None or nearest < min_human_distance_m:
             min_human_distance_m = nearest
+            min_distance_sample = sample
         footprint_clearance = nearest - footprint_collision_threshold
         if min_footprint_clearance_m is None or footprint_clearance < min_footprint_clearance_m:
             min_footprint_clearance_m = footprint_clearance
+            min_footprint_clearance_sample = sample
 
         next_odom = odom_samples[idx + 1] if idx + 1 < len(odom_samples) else None
         dt = _dt_seconds(odom, next_odom)
@@ -405,21 +438,25 @@ def generate_social_metrics(
         in_near_miss = nearest < cfg["near_miss_radius_m"]
         if in_near_miss and not near_miss_active:
             near_miss_count += 1
+            point_near_miss_events.append(sample)
         near_miss_active = in_near_miss
 
         in_human_collision = nearest < cfg["human_collision_radius_m"]
         if in_human_collision and not human_collision_active:
             human_collision_count += 1
+            point_human_collision_events.append(sample)
         human_collision_active = in_human_collision
 
         in_footprint_near_miss = footprint_clearance < cfg["near_miss_radius_m"]
         if in_footprint_near_miss and not footprint_near_miss_active:
             footprint_near_miss_count += 1
+            footprint_near_miss_events.append(sample)
         footprint_near_miss_active = in_footprint_near_miss
 
         in_footprint_human_collision = footprint_clearance < 0.0
         if in_footprint_human_collision and not footprint_human_collision_active:
             footprint_human_collision_count += 1
+            footprint_human_collision_events.append(sample)
         footprint_human_collision_active = in_footprint_human_collision
 
     humans_present = human_nonempty_samples > 0
@@ -480,12 +517,18 @@ def generate_social_metrics(
         "path_length_m": path_length_m,
         "min_human_distance_m": min_human_distance_m,
         "min_footprint_clearance_m": min_footprint_clearance_m,
+        "min_distance_sample": min_distance_sample,
+        "min_footprint_clearance_sample": min_footprint_clearance_sample,
         "personal_space_violation_time_sec": personal_space_violation_time_sec,
         "footprint_personal_space_violation_time_sec": footprint_personal_space_violation_time_sec,
         "near_miss_count": near_miss_count,
         "human_collision_count": human_collision_count,
         "footprint_near_miss_count": footprint_near_miss_count,
         "footprint_human_collision_count": footprint_human_collision_count,
+        "point_near_miss_events": point_near_miss_events,
+        "point_human_collision_events": point_human_collision_events,
+        "footprint_near_miss_events": footprint_near_miss_events,
+        "footprint_human_collision_events": footprint_human_collision_events,
         "crowd_freezing_time_sec": crowd_freezing_time_sec,
         "robot_motion_time_sec": robot_motion_time_sec,
         "human_robot_motion_overlap_time_sec": human_robot_motion_overlap_time_sec,

@@ -181,7 +181,13 @@ def test_social_metrics_reports_strict_footprint_collision(tmp_path):
     )
 
     assert result["min_footprint_clearance_m"] < 0.0
+    assert result["min_footprint_clearance_sample"]["human_id"] == "1"
+    assert result["min_footprint_clearance_sample"]["footprint_clearance_m"] == pytest.approx(
+        result["min_footprint_clearance_m"]
+    )
     assert result["footprint_human_collision_count"] >= 1
+    assert result["footprint_human_collision_events"]
+    assert result["footprint_human_collision_events"][0]["human_id"] == "1"
     assert result["strict_social_success"] is False
     assert "footprint_human_collision" in result["strict_social_failure_reasons"]
 
