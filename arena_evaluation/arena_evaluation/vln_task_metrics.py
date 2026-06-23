@@ -220,6 +220,45 @@ def _read_scenario_contract(run_dir: Path) -> dict[str, Any]:
     }
 
 
+def _task_contract_summary(contract: dict[str, Any]) -> dict[str, Any]:
+    """Document which language-task predicates this strict metric scores.
+
+    GRScenes instructions can contain rich landmark and social clauses.  The
+    minimal strict task metric currently grounds them through the recorded
+    native scenario goal rather than through a full BDDL semantic evaluator.
+    """
+    evaluated = [
+        "goal_reached(robot, native_scenario_goal)",
+        "robot_moved(robot, min_path_length_m=0.1)",
+        "not_timeout",
+        "not_commanded_stuck",
+        "not_static_occupancy_collision",
+        "not_large_teleport",
+        "start_goal_matches_native_scenario",
+    ]
+    unsupported = [
+        "landmark_sequence_followed",
+        "object_or_region_facing",
+        "orientation_at_goal",
+        "natural_language_spatial_relations",
+        "bddl_semantic_predicates",
+    ]
+    return {
+        "contract_type": "native_scenario_goal",
+        "instruction_source": "run_manifest.vln_instruction",
+        "goal_source": "arena_simulation_setup.worlds.<world>.scenarios.<scenario>.scenario.yaml robots[0].goal",
+        "goal_tolerance_source": "vln_task_metrics.DEFAULT_THRESHOLDS.goal_tolerance_m",
+        "evaluated_predicates": evaluated,
+        "unsupported_predicates": unsupported,
+        "unsupported_predicates_present": bool(str(contract.get("instruction") or "").strip()),
+        "bddl_evaluator": {
+            "available_in_package": True,
+            "used_for_this_score": False,
+            "reason": "GRScenes recorded episodes currently provide native scenario goals and free-form instructions, not grounded per-episode BDDL task files.",
+        },
+    }
+
+
 def _reference_path(contract: dict[str, Any]) -> list[tuple[float, float]]:
     start = _xy(contract.get("start_xy"))
     goal = _xy(contract.get("goal_xy"))
@@ -517,6 +556,7 @@ def generate_vln_task_metrics(
             "start_goal_csv": str(run_path / "start_goal.csv"),
         },
         "scenario_contract": contract,
+        "language_task_contract": _task_contract_summary(contract),
         "sample_counts": {
             "odom": len(odom_samples),
             "cmd_vel": len(cmd_samples),

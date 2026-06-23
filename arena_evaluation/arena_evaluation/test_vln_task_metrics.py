@@ -82,6 +82,10 @@ def test_vln_task_metrics_goal_success(monkeypatch, tmp_path):
     assert result["goal"]["goal_reached"] is True
     assert result["strict_task_success"] is True
     assert result["vln"]["spl"] == pytest.approx(1.0)
+    assert result["language_task_contract"]["contract_type"] == "native_scenario_goal"
+    assert "goal_reached(robot, native_scenario_goal)" in result["language_task_contract"]["evaluated_predicates"]
+    assert "bddl_semantic_predicates" in result["language_task_contract"]["unsupported_predicates"]
+    assert result["language_task_contract"]["bddl_evaluator"]["used_for_this_score"] is False
     assert (run_dir / "vln_task_metrics.json").exists()
 
 
