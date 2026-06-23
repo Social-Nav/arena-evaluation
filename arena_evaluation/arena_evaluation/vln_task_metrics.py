@@ -179,6 +179,36 @@ def _manifest_params(run_dir: Path) -> dict[str, Any]:
     return {"manifest": manifest, "parameters": params}
 
 
+def _read_instruction_file(path_value: Any) -> tuple[str, str | None]:
+    path_text = str(path_value or "").strip()
+    if not path_text:
+        return "", None
+    path = Path(path_text)
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return "", str(path)
+    return text, str(path)
+
+
+def _instruction_from_manifest(params: dict[str, Any]) -> dict[str, Any]:
+    instruction = str(params.get("vln_instruction") or "").strip()
+    file_instruction, file_path = _read_instruction_file(params.get("vln_instruction_file"))
+    if file_instruction:
+        return {
+            "instruction": file_instruction,
+            "instruction_source": "run_manifest.vln_instruction_file",
+            "instruction_file": file_path,
+            "manifest_instruction": instruction,
+        }
+    return {
+        "instruction": instruction,
+        "instruction_source": "run_manifest.vln_instruction",
+        "instruction_file": file_path,
+        "manifest_instruction": instruction,
+    }
+
+
 def _scenario_paths(run_dir: Path) -> dict[str, Any]:
     manifest_data = _manifest_params(run_dir)
     params = manifest_data["parameters"]
@@ -189,13 +219,14 @@ def _scenario_paths(run_dir: Path) -> dict[str, Any]:
     scenario_dir = world_dir / "scenarios" / scenario if world_dir else None
     scenario_path = scenario_dir / "scenario.yaml" if scenario_dir else None
     map_yaml = world_dir / "map" / "map.yaml" if world_dir else None
+    instruction_info = _instruction_from_manifest(params)
     return {
         "world": world,
         "scenario": scenario,
         "repo_root": str(repo_root),
         "scenario_path": scenario_path,
         "map_yaml": map_yaml,
-        "instruction": params.get("vln_instruction") or "",
+        **instruction_info,
     }
 
 
@@ -214,6 +245,9 @@ def _read_scenario_contract(run_dir: Path) -> dict[str, Any]:
         "scenario_path": str(scenario_path) if isinstance(scenario_path, Path) else None,
         "map_yaml": str(paths["map_yaml"]) if isinstance(paths["map_yaml"], Path) else None,
         "instruction": paths["instruction"],
+        "instruction_source": paths.get("instruction_source"),
+        "instruction_file": paths.get("instruction_file"),
+        "manifest_instruction": paths.get("manifest_instruction"),
         "start_xy": list(start) if start else None,
         "goal_xy": list(goal) if goal else None,
         "dynamic_actor_count": len(dynamic) if isinstance(dynamic, list) else 0,
@@ -245,7 +279,8 @@ def _task_contract_summary(contract: dict[str, Any]) -> dict[str, Any]:
     ]
     return {
         "contract_type": "native_scenario_goal",
-        "instruction_source": "run_manifest.vln_instruction",
+        "instruction_source": contract.get("instruction_source") or "run_manifest.vln_instruction",
+        "instruction_file": contract.get("instruction_file"),
         "goal_source": "arena_simulation_setup.worlds.<world>.scenarios.<scenario>.scenario.yaml robots[0].goal",
         "goal_tolerance_source": "vln_task_metrics.DEFAULT_THRESHOLDS.goal_tolerance_m",
         "evaluated_predicates": evaluated,

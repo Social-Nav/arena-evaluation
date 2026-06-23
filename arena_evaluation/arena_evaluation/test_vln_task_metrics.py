@@ -89,6 +89,44 @@ def test_vln_task_metrics_goal_success(monkeypatch, tmp_path):
     assert (run_dir / "vln_task_metrics.json").exists()
 
 
+def test_vln_task_metrics_prefers_instruction_file(monkeypatch, tmp_path):
+    repo = _make_world(tmp_path)
+    run_dir = _make_run(tmp_path)
+    instruction_file = run_dir / "instruction.txt"
+    instruction_file.write_text("Turn left and stop at the desk.", encoding="utf-8")
+    (run_dir / "run_manifest.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "parameters": {
+                    "world": "grscenes_test",
+                    "scenario_file": "default",
+                    "timeout": 120.0,
+                    "vln_instruction": "navigate",
+                    "vln_instruction_file": str(instruction_file),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ARENA_SOURCE_DIR", str(repo))
+    _write_rows(
+        run_dir / "odom.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "{'position': [0.0, 0.0, 0.0], 'velocity': [0.0, 0.0, 0.0]}"},
+            {"time": "10000000000", "data": "{'position': [1.0, 0.0, 0.0], 'velocity': [0.1, 0.0, 0.0]}"},
+        ],
+    )
+    _write_rows(run_dir / "cmd_vel.csv", ["time", "data"], [])
+
+    result = generate_vln_task_metrics(run_dir, thresholds={"robot_radius_m": 0.0})
+
+    assert result["instruction"] == "Turn left and stop at the desk."
+    assert result["scenario_contract"]["manifest_instruction"] == "navigate"
+    assert result["language_task_contract"]["instruction_source"] == "run_manifest.vln_instruction_file"
+    assert result["language_task_contract"]["instruction_file"] == str(instruction_file)
+
+
 def test_vln_task_metrics_fails_stale_start_goal(monkeypatch, tmp_path):
     repo = _make_world(tmp_path)
     run_dir = _make_run(tmp_path)
