@@ -51,7 +51,7 @@ def _make_run(tmp_path):
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "run_manifest.yaml").write_text(
-        yaml.safe_dump({"parameters": {"world": "grscenes_test", "scenario_file": "default"}}),
+        yaml.safe_dump({"parameters": {"world": "grscenes_test", "scenario_file": "default", "timeout": 120.0}}),
         encoding="utf-8",
     )
     _write_rows(
@@ -145,3 +145,25 @@ def test_vln_task_metrics_detects_map_occupancy(monkeypatch, tmp_path):
 
     assert result["static_occupancy"]["collision_sample_count"] == 1
     assert "static_occupancy_collision" in result["strict_task_failure_reasons"]
+
+
+def test_vln_task_metrics_marks_timeout_when_duration_reaches_manifest_timeout(monkeypatch, tmp_path):
+    repo = _make_world(tmp_path)
+    run_dir = _make_run(tmp_path)
+    monkeypatch.setenv("ARENA_SOURCE_DIR", str(repo))
+    _write_rows(
+        run_dir / "odom.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "{'position': [0.0, 0.0, 0.0], 'velocity': [0.1, 0.0, 0.0]}"},
+            {"time": "1200000000000", "data": "{'position': [0.2, 0.0, 0.0], 'velocity': [0.1, 0.0, 0.0]}"},
+        ],
+    )
+    _write_rows(run_dir / "cmd_vel.csv", ["time", "data"], [])
+
+    result = generate_vln_task_metrics(run_dir, thresholds={"robot_radius_m": 0.0})
+
+    assert result["episode_timing"]["duration_sec"] == pytest.approx(120.0)
+    assert result["episode_timing"]["timed_out"] is True
+    assert "episode_timeout" in result["strict_task_failure_reasons"]
+    assert "goal_not_reached" in result["strict_task_failure_reasons"]

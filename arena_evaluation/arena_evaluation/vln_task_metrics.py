@@ -29,6 +29,7 @@ DEFAULT_THRESHOLDS = {
     "large_teleport_threshold_m": 5.0,
     "max_static_collision_samples": 0,
     "max_commanded_stuck_time_sec": 0.0,
+    "timeout_margin_sec": 1.0,
 }
 
 
@@ -231,6 +232,29 @@ def _read_base_metrics(run_dir: Path) -> dict[str, Any]:
         return {"present": False, "rows": 0, "first": {}}
     first = dict(rows[0])
     return {"present": True, "rows": len(rows), "first": first}
+
+
+def _episode_timing(run_dir: Path, odom_samples: list[dict[str, Any]], cfg: dict[str, float]) -> dict[str, Any]:
+    manifest_data = _manifest_params(run_dir)
+    params = manifest_data["parameters"]
+    result = manifest_data["manifest"].get("result", {}) if isinstance(manifest_data["manifest"], dict) else {}
+    timeout_sec = _as_float(params.get("timeout"), math.inf)
+    if not math.isfinite(timeout_sec) or timeout_sec <= 0.0:
+        timeout_sec = math.inf
+    duration_sec = 0.0
+    if len(odom_samples) >= 2:
+        duration_sec = _time_seconds(int(odom_samples[-1]["time"]) - int(odom_samples[0]["time"]))
+    timed_out_by_manifest = bool(result.get("timed_out")) or str(result.get("end_reason") or "").lower() == "timeout"
+    timed_out_by_duration = math.isfinite(timeout_sec) and duration_sec >= max(0.0, timeout_sec - float(cfg["timeout_margin_sec"]))
+    return {
+        "timeout_sec": timeout_sec if math.isfinite(timeout_sec) else None,
+        "duration_sec": duration_sec,
+        "timed_out_by_manifest": timed_out_by_manifest,
+        "timed_out_by_duration": timed_out_by_duration,
+        "timed_out": timed_out_by_manifest or timed_out_by_duration,
+        "end_reason": result.get("end_reason"),
+        "finished_observed": bool(result.get("finished_observed")),
+    }
 
 
 class OccupancyMap:
@@ -447,12 +471,15 @@ def generate_vln_task_metrics(
     stuck = _commanded_stuck_intervals(odom_samples, cmd_samples, cfg)
     occupancy = _static_occupancy_collisions(odom_samples, contract.get("map_yaml"), float(cfg["robot_radius_m"]))
     teleports = _large_teleports(odom_samples, float(cfg["large_teleport_threshold_m"]))
+    timing = _episode_timing(run_path, odom_samples, cfg)
 
     failure_reasons: list[str] = []
     if not odom_samples:
         failure_reasons.append("missing_odom")
     if not goal_xy:
         failure_reasons.append("missing_scenario_goal")
+    if timing["timed_out"] and not goal_reached:
+        failure_reasons.append("episode_timeout")
     if not goal_reached:
         failure_reasons.append("goal_not_reached")
     if not start_goal_consistency["pass"]:
@@ -511,6 +538,7 @@ def generate_vln_task_metrics(
             "ndtw": metric_ndtw,
             "sdtw": metric_sdtw,
         },
+        "episode_timing": timing,
         "commanded_stuck": stuck,
         "static_occupancy": occupancy,
         "large_teleports": teleports,

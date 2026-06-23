@@ -102,7 +102,7 @@ class ZoneAwareMetric(Metric, typing.TypedDict):
 
 class Config:
 
-    TIMEOUT_TRESHOLD = 180e9
+    TIMEOUT_TRESHOLD = 180.0
     MAX_COLLISIONS = 3
     MIN_EPISODE_LENGTH = 5
 
