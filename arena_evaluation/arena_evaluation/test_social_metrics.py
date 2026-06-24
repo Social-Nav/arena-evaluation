@@ -41,7 +41,6 @@ def test_social_metrics_reads_pedsim_agents_data(tmp_path):
     assert result["path_length_m"] == 1.0
     assert result["near_miss_count"] == 0
     assert result["human_collision_count"] == 0
-    assert result["legacy_social_success"] is True
     assert result["social_success"] is False
     assert result["strict_social_success"] is False
     assert "dynamic_scene_failed" in result["strict_social_failure_reasons"]
@@ -64,7 +63,6 @@ def test_social_metrics_missing_humans_still_writes_json(tmp_path):
     assert result["humans_present"] is False
     assert result["human_sample_count"] == 0
     assert result["max_humans_observed"] == 0
-    assert result["legacy_social_success"] is False
     assert result["social_success"] is False
     assert (tmp_path / "social_metrics.json").exists()
 
@@ -230,7 +228,6 @@ def test_social_metrics_strict_failure_includes_task_failures(tmp_path):
         },
     )
 
-    assert result["legacy_social_success"] is True
     assert result["social_success"] is False
     assert result["strict_social_success"] is False
     assert "static_occupancy_collision" in result["strict_social_failure_reasons"]
