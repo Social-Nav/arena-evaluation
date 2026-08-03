@@ -1,4 +1,27 @@
-"""Strict VLN task metrics for Arena GRScenes/InternNav eval artifacts."""
+"""Strict VLN task metrics for Arena GRScenes/InternNav eval artifacts.
+
+TIME SEGMENTS
+-------------
+`odom.csv` and `cmd_vel.csv` are each several concatenated *time segments*, not
+one monotonic series.  While /clock is stalled during scene load
+``wall_clock_fallback_callback`` (``data_recorder_node.py:758-765``) fabricates
+timestamps at a fixed step; when /clock resumes at a lower value
+``_record_tick`` (``:767-778``) adopts it as the new baseline and keeps appending
+to the same file.  There is no rotation, no marker and no log, and `odom.csv`
+does not even carry an ``episode`` column, so the ONLY observable boundary is a
+backwards step in `time`.
+
+A "time segment" is one maximal run of rows whose `time` is non-decreasing.
+`time` is a valid ordering key only *within* a segment, so sorting a whole file
+by it is a shuffle, not a sort -- that is what inflated
+``vln.trajectory_length_m``.
+
+The number of segments is NOT fixed; it tracks how many times /clock stalls
+during load.  Nothing here may assume a particular count.  This module follows
+the same convention as ``social_metrics``: readers return rows in ACQUISITION
+(file) order tagged with ``order`` and ``segment``, and every consumer that
+pairs consecutive rows refuses pairs that straddle a boundary.
+"""
 
 from __future__ import annotations
 
@@ -88,8 +111,29 @@ def _distance(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def _read_odom(run_dir: Path) -> list[dict[str, Any]]:
+    """Read odom.csv in ACQUISITION (file) order, tagged with a recording time segment.
+
+    The previous implementation ended with ``sorted(samples, key=time)``, which is
+    a shuffle rather than a sort because `time` is comparable only within a segment
+    (see the module docstring).  That interleaved rows recorded in different
+    segments and inflated ``vln.trajectory_length_m`` -- by up to x41 in the
+    delivered runs.
+
+    Row order in the file is the true sample order: the recorder's tick runs in
+    the node's default, mutually exclusive callback group, so writes are
+    serialised.  `time` is retained for durations and for nearest-in-time lookups.
+
+    Each sample carries:
+      ``order``   -- the row index in the file, i.e. the acquisition sequence number
+      ``segment`` -- 0-based time segment, incremented at every backwards `time` step
+
+    This mirrors ``social_metrics._read_odom`` exactly, so all three readers in
+    this package follow one convention.
+    """
     samples: list[dict[str, Any]] = []
-    for row in _read_csv(run_dir / "odom.csv"):
+    segment = 0
+    previous_time: int | None = None
+    for order, row in enumerate(_read_csv(run_dir / "odom.csv")):
         data = _parse_value(row.get("data"))
         if not isinstance(data, dict):
             continue
@@ -103,36 +147,135 @@ def _read_odom(run_dir: Path) -> list[dict[str, Any]]:
                 vx = _as_float(velocity[0])
             if len(velocity) > 1:
                 vy = _as_float(velocity[1])
+        sample_time = int(_as_float(row.get("time")))
+        if previous_time is not None and sample_time < previous_time:
+            segment += 1
+        previous_time = sample_time
         samples.append(
             {
-                "time": int(_as_float(row.get("time"))),
+                "time": sample_time,
                 "x": position[0],
                 "y": position[1],
                 "speed": math.hypot(vx, vy),
+                "order": order,
+                "segment": segment,
             }
         )
-    return sorted(samples, key=lambda sample: sample["time"])
+    return samples
 
 
 def _read_cmd_vel(run_dir: Path) -> list[dict[str, Any]]:
+    """Read cmd_vel.csv in ACQUISITION (file) order, tagged with a recording time segment.
+
+    Same treatment and same tags as ``_read_odom``.  Consumers that need a
+    monotonic time axis -- currently only the ``_latest_before_or_equal`` scan --
+    must take a time-ordered view via ``_time_ordered``, exactly as
+    ``social_metrics`` does for its pedestrian bisect.
+    """
     samples: list[dict[str, Any]] = []
-    for row in _read_csv(run_dir / "cmd_vel.csv"):
+    segment = 0
+    previous_time: int | None = None
+    for order, row in enumerate(_read_csv(run_dir / "cmd_vel.csv")):
         data = _parse_value(row.get("data"))
         if not isinstance(data, (list, tuple)):
             continue
         vx = _as_float(data[0]) if data else 0.0
         vy = _as_float(data[1]) if len(data) > 1 else 0.0
         wz = _as_float(data[2]) if len(data) > 2 else 0.0
+        sample_time = int(_as_float(row.get("time")))
+        if previous_time is not None and sample_time < previous_time:
+            segment += 1
+        previous_time = sample_time
         samples.append(
             {
-                "time": int(_as_float(row.get("time"))),
+                "time": sample_time,
                 "vx": vx,
                 "vy": vy,
                 "wz": wz,
                 "linear_speed": math.hypot(vx, vy),
+                "order": order,
+                "segment": segment,
             }
         )
-    return sorted(samples, key=lambda sample: sample["time"])
+    return samples
+
+
+def _time_ordered(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A `time`-ascending view, required by the ``_latest_before_or_equal`` scan.
+
+    This is a view for lookups only.  It must never be used for anything that
+    pairs consecutive samples, which is the whole point of the segment tags.
+    """
+    return sorted(samples, key=lambda sample: int(sample["time"]))
+
+
+def _segment_runs(samples: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Split acquisition-ordered samples into contiguous per-segment runs."""
+    runs: list[list[dict[str, Any]]] = []
+    for sample in samples:
+        if runs and int(runs[-1][-1].get("segment", 0)) == int(sample.get("segment", 0)):
+            runs[-1].append(sample)
+        else:
+            runs.append([sample])
+    return runs
+
+
+def _next_in_segment(samples: list[dict[str, Any]], idx: int) -> dict[str, Any] | None:
+    """The next sample, or None if it belongs to a different recording time segment.
+
+    A cross-segment successor carries a LOWER `time`, so it yields no usable
+    duration and no usable step distance.  Treating it as absent makes the last
+    sample of every segment behave like the last sample of the run, a case the
+    callers already handle.
+    """
+    if idx + 1 >= len(samples):
+        return None
+    nxt = samples[idx + 1]
+    if int(nxt.get("segment", 0)) != int(samples[idx].get("segment", 0)):
+        return None
+    return nxt
+
+
+def _superseded_ranges(samples: list[dict[str, Any]]) -> dict[int, list[tuple[int, int]]]:
+    """For each time segment, the `time` ranges that a LATER segment also covers.
+
+    The segments overlap in sim time -- every pre-episode segment restarts near
+    t=0 while the final segment spans the whole episode -- so summing a duration
+    per segment counts the first few seconds several times and can report more
+    elapsed time than the recording contains.  Under SUPERSESSION the later
+    segment owns any instant both cover, so each real instant is counted once.
+    Same rule and same shape as ``social_metrics._superseded_ranges``.
+    """
+    coverage: dict[int, tuple[int, int]] = {}
+    for sample in samples:
+        segment = int(sample.get("segment", 0))
+        stamp = int(sample["time"])
+        low, high = coverage.get(segment, (stamp, stamp))
+        coverage[segment] = (min(low, stamp), max(high, stamp))
+    ranges: dict[int, list[tuple[int, int]]] = {}
+    for segment in coverage:
+        merged: list[list[int]] = []
+        for low, high in sorted(span for other, span in coverage.items() if other > segment):
+            if merged and low <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], high)
+            else:
+                merged.append([low, high])
+        ranges[segment] = [(low, high) for low, high in merged]
+    return ranges
+
+
+def _credited_seconds(start: int, end: int, superseded: list[tuple[int, int]]) -> float:
+    """``end - start`` in seconds, minus any part a later time segment re-covers."""
+    if end <= start:
+        return 0.0
+    remaining = end - start
+    for low, high in superseded:
+        if high <= start:
+            continue
+        if low >= end:
+            break
+        remaining -= min(end, high) - max(start, low)
+    return max(0.0, remaining) / RECORDER_TIME_UNITS_PER_SECOND
 
 
 def _latest_before_or_equal(samples: list[dict[str, Any]], time_raw: int) -> dict[str, Any] | None:
@@ -317,7 +460,14 @@ def _episode_timing(run_dir: Path, odom_samples: list[dict[str, Any]], cfg: dict
         timeout_sec = math.inf
     duration_sec = 0.0
     if len(odom_samples) >= 2:
-        duration_sec = _time_seconds(int(odom_samples[-1]["time"]) - int(odom_samples[0]["time"]))
+        # Order-invariant by construction.  The previous `odom[-1] - odom[0]` was
+        # only correct because the list had been globally sorted by `time`; in
+        # acquisition order the first and last ROWS are not necessarily the
+        # earliest and latest STAMPS.  They happen to be in every delivered run,
+        # so this keeps the reported value identical while no longer depending on
+        # that coincidence.
+        stamps = [int(sample["time"]) for sample in odom_samples]
+        duration_sec = _time_seconds(max(stamps) - min(stamps))
     timed_out_by_manifest = bool(result.get("timed_out")) or str(result.get("end_reason") or "").lower() == "timeout"
     timed_out_by_duration = math.isfinite(timeout_sec) and duration_sec >= max(0.0, timeout_sec - float(cfg["timeout_margin_sec"]))
     return {
@@ -445,52 +595,117 @@ def _commanded_stuck_intervals(
     cmd_samples: list[dict[str, Any]],
     cfg: dict[str, float],
 ) -> dict[str, Any]:
+    """Total time the robot was commanded to translate but did not move.
+
+    ``odom_samples`` must be in acquisition order (see ``_read_odom``).  Two
+    time-segment hazards are handled explicitly:
+
+    * A cross-segment successor is treated as absent, so no step speed and no
+      duration is ever computed across a splice.
+    * An open stuck interval is CLOSED at a segment boundary.  Otherwise its
+      ``start`` and ``end`` could come from different segments, making
+      ``end - start`` meaningless and potentially negative.
+    * Each interval's duration is credited under SUPERSESSION, so an instant two
+      overlapping segments both report as stuck is counted once and the total can
+      never exceed the recording span.
+
+    The command lookup uses a time-ordered view of ``cmd_samples`` because
+    ``_latest_before_or_equal`` scans and breaks on the first later stamp.  Note
+    that `cmd_vel.csv` need not have the same segment structure as `odom.csv`
+    (one delivered run has 4 odom segments and 3 command segments), so commands
+    are deliberately NOT matched by segment index.
+    """
     intervals: list[dict[str, float]] = []
     active_start: int | None = None
     active_end: int | None = None
+    active_segment: int = 0
     total = 0.0
     commanded_threshold = float(cfg["commanded_speed_threshold_mps"])
     motion_threshold = float(cfg["stuck_motion_threshold_mps"])
     min_duration = float(cfg["stuck_min_duration_sec"])
+    cmd_by_time = _time_ordered(cmd_samples)
+    superseded = _superseded_ranges(odom_samples)
+    segment_boundaries_skipped = 0
 
-    for idx in range(len(odom_samples) - 1):
+    def close_active() -> None:
+        nonlocal active_start, active_end, total
+        if active_start is not None and active_end is not None:
+            duration = _time_seconds(active_end - active_start)
+            if duration >= min_duration:
+                credited = _credited_seconds(active_start, active_end, superseded.get(active_segment, []))
+                intervals.append(
+                    {
+                        "start_sec": _time_seconds(active_start),
+                        "end_sec": _time_seconds(active_end),
+                        "duration_sec": duration,
+                        "credited_duration_sec": credited,
+                    }
+                )
+                total += credited
+        active_start = None
+        active_end = None
+
+    for idx in range(len(odom_samples)):
         current = odom_samples[idx]
-        nxt = odom_samples[idx + 1]
+        nxt = _next_in_segment(odom_samples, idx)
+        if nxt is None:
+            # end of a segment (or of the run): no successor to measure against
+            if idx + 1 < len(odom_samples):
+                segment_boundaries_skipped += 1
+            close_active()
+            continue
         dt = max(0.0, _time_seconds(nxt["time"] - current["time"]))
         if dt <= 0.0:
             continue
-        cmd = _latest_before_or_equal(cmd_samples, int(current["time"]))
+        cmd = _latest_before_or_equal(cmd_by_time, int(current["time"]))
         commanded = bool(cmd and float(cmd["linear_speed"]) >= commanded_threshold)
         step_speed = _distance((current["x"], current["y"]), (nxt["x"], nxt["y"])) / dt
         stuck = commanded and step_speed < motion_threshold
         if stuck:
             if active_start is None:
                 active_start = int(current["time"])
+                active_segment = int(current.get("segment", 0))
             active_end = int(nxt["time"])
-        elif active_start is not None and active_end is not None:
-            duration = _time_seconds(active_end - active_start)
-            if duration >= min_duration:
-                intervals.append({"start_sec": _time_seconds(active_start), "end_sec": _time_seconds(active_end), "duration_sec": duration})
-                total += duration
-            active_start = None
-            active_end = None
-    if active_start is not None and active_end is not None:
-        duration = _time_seconds(active_end - active_start)
-        if duration >= min_duration:
-            intervals.append({"start_sec": _time_seconds(active_start), "end_sec": _time_seconds(active_end), "duration_sec": duration})
-            total += duration
-    return {"commanded_stuck_time_sec": total, "commanded_stuck_intervals": intervals}
+        else:
+            close_active()
+    close_active()
+    return {
+        "commanded_stuck_time_sec": total,
+        "commanded_stuck_intervals": intervals,
+        "commanded_stuck_segment_boundaries_skipped": segment_boundaries_skipped,
+    }
 
 
 def _large_teleports(odom_samples: list[dict[str, Any]], threshold_m: float) -> list[dict[str, Any]]:
+    """Steps longer than ``threshold_m``, over acquisition-ordered samples.
+
+    A pair straddling a time-segment boundary is not a displacement at all -- the
+    recorder simply resumed from a lower /clock value -- so it is skipped, exactly
+    as ``social_metrics._path_length_and_teleports`` does.  Without this a
+    backwards clock step could be reported as a teleport and fail the run.
+    """
     teleports: list[dict[str, Any]] = []
     for idx in range(1, len(odom_samples)):
         prev = odom_samples[idx - 1]
         curr = odom_samples[idx]
+        if int(prev.get("segment", 0)) != int(curr.get("segment", 0)):
+            continue
         dist = _distance((prev["x"], prev["y"]), (curr["x"], curr["y"]))
         if dist > threshold_m:
             teleports.append({"index": idx, "time_sec": _time_seconds(curr["time"]), "distance_m": dist})
     return teleports
+
+
+def _trajectory_length_m(odom_samples: list[dict[str, Any]]) -> tuple[float, int]:
+    """Integrate the executed path, refusing to cross a time-segment boundary.
+
+    Returns ``(length_m, segment_boundaries_skipped)``.  The generic
+    ``path_length_xy`` helper is correct for a single polyline, so it is applied
+    per segment and the results summed rather than being changed.
+    """
+    runs = _segment_runs(odom_samples)
+    length = sum(path_length_xy([(s["x"], s["y"]) for s in run]) for run in runs)
+    return length, max(0, len(runs) - 1)
 
 
 def generate_vln_task_metrics(
@@ -512,7 +727,7 @@ def generate_vln_task_metrics(
     nav_error = navigation_error(final_xy, goal_xy) if final_xy and goal_xy else math.inf
     oracle = oracle_error(executed_xy, goal_xy) if goal_xy else math.inf
     goal_reached = nav_error <= float(cfg["goal_tolerance_m"])
-    executed_len = path_length_xy(executed_xy)
+    executed_len, trajectory_segment_boundaries_skipped = _trajectory_length_m(odom_samples)
     shortest_len = path_length_xy(reference_xy)
     metric_spl = spl(goal_reached, shortest_len, executed_len)
     metric_ndtw = ndtw(executed_xy, reference_xy, float(cfg["goal_tolerance_m"])) if reference_xy else 0.0
@@ -595,6 +810,13 @@ def generate_vln_task_metrics(
         "sample_counts": {
             "odom": len(odom_samples),
             "cmd_vel": len(cmd_samples),
+            "odom_recording_segments": (
+                (max(int(s.get("segment", 0)) for s in odom_samples) + 1) if odom_samples else 0
+            ),
+            "cmd_vel_recording_segments": (
+                (max(int(s.get("segment", 0)) for s in cmd_samples) + 1) if cmd_samples else 0
+            ),
+            "odom_segment_boundaries_skipped": trajectory_segment_boundaries_skipped,
         },
         "start_goal_consistency": start_goal_consistency,
         "goal": {

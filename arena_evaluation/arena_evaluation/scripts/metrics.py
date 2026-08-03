@@ -119,15 +119,26 @@ class Math:
 
     @classmethod
     def grouping(cls, base: np.ndarray, size: int) -> np.ndarray:
-        return np.moveaxis(
-            np.array([
-                np.roll(base, i, 0)
-                for i
-                in range(size)
-            ]),
-            [1],
-            [0]
-        )[:-size]
+        """Every consecutive window of ``size`` samples, newest-first within a window.
+
+        Window ``i`` is ``(base[i+size-1], ..., base[i])``, so ``window[:, 0]`` is
+        the later sample and ``window[:, -1]`` the earlier one, matching how the
+        callers index.  There are ``len(base) - size + 1`` windows.
+
+        This used to be built with ``np.roll``, which WRAPS: window 0 was
+        ``(base[0], base[-1], ...)``, pairing the first sample of the episode with
+        the last.  A trailing ``[:-size]`` slice then discarded the final windows.
+        For `path_length` that meant the first term was the distance from the last
+        pose all the way back to the first -- 5.910 m of case01's reported
+        17.565 m -- while the last two real steps were dropped.  Reproduced
+        exactly: the delivered metrics.csv `path_length_values` has
+        ``len(odom) - 2`` entries whose first element equals that wrap distance in
+        all seven runs.
+        """
+        n = len(base)
+        if size <= 0 or n < size:
+            return np.empty((0, size) + base.shape[1:], dtype=base.dtype)
+        return np.array([base[i + size - 1 :: -1][:size] for i in range(n - size + 1)])
 
     @classmethod
     def triangles(cls, position: np.ndarray) -> np.ndarray:
@@ -144,10 +155,76 @@ class Math:
             axis=1
         ) / 2
 
+    # Odom `position` is [x, y, yaw] and `velocity` is [linear.x, linear.y,
+    # angular.z], so the first two components are metres or metres per second and
+    # the third is radians or radians per second.  Anything that takes a Euclidean
+    # norm must therefore use only the planar columns; norming all three adds
+    # radians in quadrature with metres and yields a number in no unit at all.
+    PLANAR_COLUMNS = 2
+
     @classmethod
-    def path_length(cls, position: np.ndarray) -> np.ndarray:
-        pairs = cls.grouping(position, 2)
-        return np.linalg.norm(pairs[:, 0, :] - pairs[:, 1, :], axis=1)
+    def planar(cls, values: np.ndarray) -> np.ndarray:
+        """Drop the yaw column of an [x, y, yaw]-style sample array.
+
+        Applied to the SAMPLE array, before any grouping, so the trailing axis of
+        the result is the coordinate axis.
+        """
+        values = np.asarray(values)
+        if values.ndim < 2 or values.shape[-1] <= cls.PLANAR_COLUMNS:
+            return values
+        return values[..., : cls.PLANAR_COLUMNS]
+
+    @classmethod
+    def segment_boundaries(cls, times: np.ndarray) -> np.ndarray:
+        """Mask of consecutive-pair indices that straddle a recording time segment.
+
+        The recorder concatenates several time segments into one CSV: while /clock
+        is stalled during scene load it fabricates timestamps, then adopts the
+        lower resumed value as a new baseline and keeps appending, with no
+        rotation, no marker and no log.  A backwards step in `time` is the only
+        observable boundary.
+
+        Rows reach this module in acquisition order -- pandas preserves file order
+        and nothing here sorts -- so pair ``i`` spans ``times[i] -> times[i+1]`` and
+        crosses a boundary exactly when that step is negative.  Such a pair is not
+        a displacement and not a turn: the recorder simply resumed from a lower
+        clock value.
+
+        Returns a boolean array of length ``len(times) - 1``.  Nothing assumes how
+        many segments there are; the count tracks how often /clock stalls.
+        """
+        times = np.asarray(times, dtype=float)
+        if times.size < 2:
+            return np.zeros(0, dtype=bool)
+        return np.diff(times) < 0.0
+
+    @classmethod
+    def _drop_segment_boundaries(cls, steps: np.ndarray, times: np.ndarray | None) -> np.ndarray:
+        if times is None:
+            return steps
+        boundaries = cls.segment_boundaries(times)
+        if boundaries.size != steps.size:
+            return steps
+        return np.where(boundaries, 0.0, steps)
+
+    @classmethod
+    def path_length(cls, position: np.ndarray, times: np.ndarray | None = None) -> np.ndarray:
+        """Distance travelled between consecutive samples, in metres.
+
+        Only x and y participate.  Previously the norm was taken over the full
+        [x, y, yaw] row, so a pure rotation registered as translation and the
+        result was dimensionally invalid.  The effect is large, not cosmetic: the
+        delivered case01 total was 11.6575 with yaw included against 2.1203 for the
+        planar path, because that run turned through 359.3 degrees while advancing
+        1.44 m.
+
+        When ``times`` is supplied, a step that straddles a recording time-segment
+        boundary contributes 0.0.  That is what makes this agree with
+        ``social_metrics.path_length_m``, which skips the same pairs.
+        """
+        pairs = cls.grouping(cls.planar(position), 2)
+        steps = np.linalg.norm(pairs[:, 0, :] - pairs[:, 1, :], axis=1)
+        return cls._drop_segment_boundaries(steps, times)
 
     @classmethod
     def curvature(cls, position: np.ndarray) -> typing.Tuple[np.ndarray, np.ndarray]:
@@ -195,9 +272,17 @@ class Math:
         return np.diff(np.diff(speed))
 
     @classmethod
-    def turn(cls, yaw: np.ndarray) -> np.ndarray:
+    def turn(cls, yaw: np.ndarray, times: np.ndarray | None = None) -> np.ndarray:
+        """Absolute yaw change between consecutive samples, in radians.
+
+        When ``times`` is supplied, a step across a recording time-segment boundary
+        contributes 0.0: the yaw difference between the last pose of one segment
+        and the first of the next is a clock rebase, not a turn.  `turn` feeds
+        `angle_over_length`, whose denominator already excludes those pairs.
+        """
         pairs = cls.grouping(yaw, 2)
-        return cls.angle_difference(pairs[:, 0], pairs[:, 1])
+        steps = cls.angle_difference(pairs[:, 0], pairs[:, 1])
+        return cls._drop_segment_boundaries(steps, times)
 
     @classmethod
     def angle_difference(cls, x1: np.ndarray, x2: np.ndarray) -> np.ndarray:
@@ -309,12 +394,20 @@ class Metrics:
         episode["time"] /= 10**10
 
         positions = np.array([frame["position"] for frame in episode["odom"]])
-        velocities = np.array([frame["position"] for frame in episode["odom"]])
+        # `velocity`, not `position`.  Reading position here made `velocity`,
+        # `acceleration` and `jerk` functions of the robot's DISTANCE FROM THE
+        # ORIGIN: every delivered metrics.csv has velocity[i] == |position[i]|,
+        # e.g. a first sample of 5.257 for a robot standing at
+        # (3.926, -2.012, -2.86), which is a pose, not a speed.
+        velocities = np.array([frame["velocity"] for frame in episode["odom"]])
 
         curvature, normalized_curvature = Math.curvature(positions)
         roughness = Math.roughness(positions)
 
-        vel_absolute = np.linalg.norm(velocities, axis=1)
+        # Linear speed only.  `velocity` is [linear.x, linear.y, angular.z], so
+        # norming all three added rad/s in quadrature with m/s.  This matches
+        # `social_metrics` and `vln_task_metrics`, which both take hypot(vx, vy).
+        vel_absolute = np.linalg.norm(Math.planar(velocities), axis=1)
         acceleration = Math.acceleration(vel_absolute)
         jerk = Math.jerk(vel_absolute)
 
@@ -329,8 +422,13 @@ class Metrics:
             # still emitting odometry/path metrics for the episode.
             collisions, collision_amount = [], None
 
-        path_length = Math.path_length(positions)
-        turn = Math.turn(positions[:, 2])
+        # Sample timestamps, in acquisition order, used to detect recording
+        # time-segment boundaries.  Without this the polyline is charged for the
+        # recorder's backwards /clock rebase as if the robot had teleported, which
+        # is why metrics.csv disagreed with social_metrics.path_length_m.
+        sample_times = np.array(episode["time"], dtype=float)
+        path_length = Math.path_length(positions, sample_times)
+        turn = Math.turn(positions[:, 2], sample_times)
 
         time = list(episode["time"])[-1] - list(episode["time"])[0]
 

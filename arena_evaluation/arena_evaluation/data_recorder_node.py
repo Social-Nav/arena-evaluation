@@ -224,7 +224,128 @@ class DataCollector(Node):
     #     ]
 
 
-class Recorder(Node):
+class TimeSegmentTracker:
+    """Makes a backwards /clock step observable instead of silently absorbing it.
+
+    THE DEFECT THIS EXISTS FOR
+    --------------------------
+    While /clock is stalled -- which happens for several seconds during scene load
+    -- ``wall_clock_fallback_callback`` keeps recording by FABRICATING sim
+    timestamps that advance by one record period each tick.  Those stamps run well
+    past the last value /clock actually published.  When /clock resumes it
+    therefore looks like time jumped backwards, and ``_record_tick`` used to
+    absorb that by adopting the lower value as its new baseline and carrying on
+    appending to the same CSV.
+
+    Nothing recorded the event: no file rotation, no marker, no log line, and the
+    ``episode`` column stayed at 0.  The result is a CSV that is several
+    concatenated *time segments* rather than one monotonic series, with the only
+    observable boundary being the backwards step itself.  Every consumer that
+    sorted rows by `time` was therefore shuffling them, which inflated pedestrian
+    travel, robot path length and the legacy path length -- by up to x41 in the
+    delivered runs.
+
+    WHAT THIS CHANGES
+    -----------------
+    The splice is still allowed to happen, because refusing it would mean dropping
+    data, but it is no longer silent:
+
+      * a WARNING names both stamps, the size of the step, and the classification
+      * a sidecar ``recording_segments.csv`` records every boundary, so a consumer
+        reads the segment structure instead of having to infer it
+      * fabricated stamps are counted and announced when they start, so the rows
+        that carry a lie about sim time can be identified
+
+    Boundaries are classified, because the two causes need different responses:
+
+      ``synthetic_overshoot`` -- the resumed stamp is at or above the last value
+          /clock actually published, so sim time never went backwards at all; our
+          own fabricated stamps overshot.  This is the cause of every boundary in
+          the delivered runs.
+      ``sim_clock_reset`` -- the resumed stamp is below the last real /clock
+          reading, i.e. the simulator's clock genuinely restarted.
+
+    Deliberately NOT changed: the fabrication strategy itself.  Holding the stamp
+    at the last real /clock value instead of advancing it would remove the
+    overshoot at the source, but it also changes which rows get written and how
+    they are stamped, and that cannot be validated without a full eval run.  The
+    counts and the classification recorded here are what a future lane needs to
+    make that call on evidence.
+
+    Nothing here assumes how many segments a run will have; the count tracks how
+    often /clock stalls.
+    """
+
+    SEGMENT_MARKER_FILE = "recording_segments"
+    SEGMENT_MARKER_HEADER = [
+        "segment",
+        "previous_time",
+        "resumed_time",
+        "backwards_by",
+        "kind",
+        "synthetic_rows_before",
+    ]
+
+    def _init_time_segment_state(self):
+        # last stamp that came from /clock rather than from the fallback
+        self._last_real_clock_time = None
+        # True while the fallback is fabricating stamps ahead of /clock
+        self._synthetic_time_active = False
+        # rows written carrying a fabricated stamp
+        self._synthetic_row_count = 0
+        # 0-based index of the time segment currently being written
+        self._recording_segment = 0
+        self._segment_marker_started = False
+
+    def _classify_backwards_step(self, resumed_time) -> str:
+        if self._last_real_clock_time is not None and resumed_time >= self._last_real_clock_time:
+            return "synthetic_overshoot"
+        return "sim_clock_reset"
+
+    def _note_time_segment_boundary(self, previous_time, resumed_time) -> None:
+        """Log and persist a boundary.  Never raises: recording must not stop."""
+        self._recording_segment += 1
+        kind = self._classify_backwards_step(resumed_time)
+        backwards_by = int(previous_time) - int(resumed_time)
+        try:
+            if not self._segment_marker_started:
+                self.write_data(self.SEGMENT_MARKER_FILE, self.SEGMENT_MARKER_HEADER, mode="w")
+                self._segment_marker_started = True
+            self.write_data(
+                self.SEGMENT_MARKER_FILE,
+                [
+                    self._recording_segment,
+                    int(previous_time),
+                    int(resumed_time),
+                    backwards_by,
+                    kind,
+                    self._synthetic_row_count,
+                ],
+            )
+        except BaseException as exc:  # pragma: no cover - marker must never stop recording
+            self.get_logger().error(f"Could not write the time-segment marker: {exc}")
+        self.get_logger().warn(
+            f"/clock stepped BACKWARDS: {int(previous_time)} -> {int(resumed_time)} "
+            f"({backwards_by} units, {kind}). Recording continues in the same files, so "
+            f"they now hold {self._recording_segment + 1} concatenated time segments and "
+            f"`time` is NOT a valid global sort key. "
+            f"{self._synthetic_row_count} rows so far carry a fabricated stamp. "
+            f"Boundaries are listed in {self.SEGMENT_MARKER_FILE}.csv."
+        )
+
+    def _note_synthetic_time_started(self, step_units) -> None:
+        if self._synthetic_time_active:
+            return
+        self._synthetic_time_active = True
+        self.get_logger().warn(
+            f"/clock has not progressed for two record periods, so recording continues with "
+            f"FABRICATED sim timestamps advancing {step_units} units per tick. These stamps do "
+            f"not reflect simulator time; when /clock resumes they will appear as a forward "
+            f"jump followed by a backwards step."
+        )
+
+
+class Recorder(TimeSegmentTracker, Node):
 
     def __init__(self, result_dir):
 
@@ -286,6 +407,7 @@ class Recorder(Node):
         self._last_clock_progress_wall_time = 0.0
         self._last_clock_sim_time = None
         self._last_record_wall_time = 0.0
+        self._init_time_segment_state()
 
         self.current_episode = 0
         self.current_time = None
@@ -413,6 +535,7 @@ class Recorder(Node):
         if self._last_clock_sim_time != current_simulation_action_time:
             self._last_clock_sim_time = current_simulation_action_time
             self._last_clock_progress_wall_time = time.monotonic()
+            self._synthetic_time_active = False
 
         self._record_tick(current_simulation_action_time)
 
@@ -423,14 +546,22 @@ class Recorder(Node):
             return
         step_ns = int(float(self.config["record_frequency"]) * 1_000_000)
         synthetic_time = self.current_time + step_ns
-        self._record_tick(synthetic_time)
+        self._note_synthetic_time_started(step_ns)
+        self._record_tick(synthetic_time, synthetic=True)
 
-    def _record_tick(self, current_simulation_action_time):
+    def _record_tick(self, current_simulation_action_time, synthetic=False):
 
         if self.current_time is None:
             self.current_time = current_simulation_action_time
         elif current_simulation_action_time < self.current_time:
+            # A backwards step splices two time segments into one set of files.
+            # Report it before rebasing so no consumer is handed spliced data
+            # without a marker (see TimeSegmentTracker).
+            self._note_time_segment_boundary(self.current_time, current_simulation_action_time)
             self.current_time = current_simulation_action_time
+
+        if not synthetic:
+            self._last_real_clock_time = current_simulation_action_time
 
         time_diff = (current_simulation_action_time - self.current_time) / 1e6  # in ms
 
@@ -439,6 +570,8 @@ class Recorder(Node):
 
         self.current_time = current_simulation_action_time
         self._last_record_wall_time = time.monotonic()
+        if synthetic:
+            self._synthetic_row_count += 1
 
         for collector in self.data_collectors:
 
@@ -464,7 +597,7 @@ class Recorder(Node):
         return response
 
 
-class BagRecorder(Node):
+class BagRecorder(TimeSegmentTracker, Node):
     def __init__(self, result_dir: str):
         super().__init__("bag_recorder_node")
 
@@ -640,6 +773,7 @@ class BagRecorder(Node):
         self._last_clock_progress_wall_time = 0.0
         self._last_clock_sim_time = None
         self._last_record_wall_time = 0.0
+        self._init_time_segment_state()
         self.wall_clock_timer = self.create_timer(
             self._record_period_sec,
             self.wall_clock_fallback_callback,
@@ -752,6 +886,7 @@ class BagRecorder(Node):
         if self._last_clock_sim_time != current_simulation_action_time:
             self._last_clock_sim_time = current_simulation_action_time
             self._last_clock_progress_wall_time = time.monotonic()
+            self._synthetic_time_active = False
 
         self._record_tick(current_simulation_action_time)
 
@@ -762,13 +897,21 @@ class BagRecorder(Node):
             return
         step_ns = int(float(self.config["record_frequency"]) * 1_000_000)
         synthetic_time = self.current_time + step_ns
-        self._record_tick(synthetic_time)
+        self._note_synthetic_time_started(step_ns)
+        self._record_tick(synthetic_time, synthetic=True)
 
-    def _record_tick(self, current_simulation_action_time):
+    def _record_tick(self, current_simulation_action_time, synthetic=False):
         if self.current_time is None:
             self.current_time = current_simulation_action_time
         elif current_simulation_action_time < self.current_time:
+            # A backwards step splices two time segments into one set of files and
+            # into the rosbag.  Report it before rebasing so no consumer is handed
+            # spliced data without a marker (see TimeSegmentTracker).
+            self._note_time_segment_boundary(self.current_time, current_simulation_action_time)
             self.current_time = current_simulation_action_time
+
+        if not synthetic:
+            self._last_real_clock_time = current_simulation_action_time
 
         # Record at the configured frequency (in ms) from the configuration file
         time_diff = (current_simulation_action_time - self.current_time) / 1e6  # in ms
@@ -777,6 +920,8 @@ class BagRecorder(Node):
 
         self.current_time = current_simulation_action_time
         self._last_record_wall_time = time.monotonic()
+        if synthetic:
+            self._synthetic_row_count += 1
 
         # For each DataCollector, retrieve the last message and record it into the rosbag.
         for collector in self.data_collectors:
