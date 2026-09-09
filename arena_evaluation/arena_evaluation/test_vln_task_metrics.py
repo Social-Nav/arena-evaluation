@@ -5,7 +5,11 @@ import pytest
 import yaml
 from PIL import Image
 
-from arena_evaluation.vln_task_metrics import _read_odom, generate_vln_task_metrics
+from arena_evaluation.vln_task_metrics import (
+    _map_reference_path,
+    _read_odom,
+    generate_vln_task_metrics,
+)
 
 
 def _write_rows(path, fieldnames, rows):
@@ -82,11 +86,48 @@ def test_vln_task_metrics_goal_success(monkeypatch, tmp_path):
     assert result["goal"]["goal_reached"] is True
     assert result["strict_task_success"] is True
     assert result["vln"]["spl"] == pytest.approx(1.0)
+    assert result["vln"]["reference_path"]["source"] == "occupancy_grid_astar"
+    assert result["vln"]["reference_path"]["available"] is True
     assert result["language_task_contract"]["contract_type"] == "native_scenario_goal"
     assert "goal_reached(robot, native_scenario_goal)" in result["language_task_contract"]["evaluated_predicates"]
     assert "bddl_semantic_predicates" in result["language_task_contract"]["unsupported_predicates"]
     assert result["language_task_contract"]["bddl_evaluator"]["used_for_this_score"] is False
     assert (run_dir / "vln_task_metrics.json").exists()
+
+
+def test_map_reference_path_routes_around_an_occupied_wall(tmp_path):
+    pixels = [(10, y) for y in range(8, 20)]
+    repo = _make_world(tmp_path, map_pixels=pixels)
+    map_yaml = repo / "arena_simulation_setup/worlds/grscenes_test/map/map.yaml"
+    contract = {
+        "map_yaml": str(map_yaml),
+        "start_xy": [0.2, 0.5],
+        "goal_xy": [1.7, 0.5],
+    }
+
+    path, metadata = _map_reference_path(contract, 0.0, 0.1)
+
+    assert metadata["available"] is True
+    assert metadata["path_length_m"] > 1.5
+    assert path[0] == (0.2, 0.5)
+    assert path[-1] == (1.7, 0.5)
+
+
+def test_map_reference_path_fails_when_wall_blocks_the_map(tmp_path):
+    pixels = [(10, y) for y in range(20)]
+    repo = _make_world(tmp_path, map_pixels=pixels)
+    map_yaml = repo / "arena_simulation_setup/worlds/grscenes_test/map/map.yaml"
+    contract = {
+        "map_yaml": str(map_yaml),
+        "start_xy": [0.2, 0.5],
+        "goal_xy": [1.7, 0.5],
+    }
+
+    path, metadata = _map_reference_path(contract, 0.0, 0.1)
+
+    assert path == []
+    assert metadata["available"] is False
+    assert metadata["reason"] == "no_traversable_path"
 
 
 def test_vln_task_metrics_prefers_instruction_file(monkeypatch, tmp_path):
@@ -209,6 +250,38 @@ def test_vln_task_metrics_marks_timeout_when_duration_reaches_manifest_timeout(m
     assert result["episode_timing"]["timed_out"] is True
     assert "episode_timeout" in result["strict_task_failure_reasons"]
     assert "goal_not_reached" in result["strict_task_failure_reasons"]
+
+
+def test_vln_task_metrics_marks_episode_wall_timeout_from_manifest(monkeypatch, tmp_path):
+    repo = _make_world(tmp_path)
+    run_dir = _make_run(tmp_path)
+    monkeypatch.setenv("ARENA_SOURCE_DIR", str(repo))
+    (run_dir / "run_manifest.yaml").write_text(
+        yaml.safe_dump({
+            "parameters": {
+                "world": "grscenes_test",
+                "scenario_file": "default",
+                "timeout": 120.0,
+            },
+            "result": {"end_reason": "episode_wall_timeout", "timed_out": False},
+        }),
+        encoding="utf-8",
+    )
+    _write_rows(
+        run_dir / "odom.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "{'position': [0.0, 0.0, 0.0], 'velocity': [0.1, 0.0, 0.0]}"},
+            {"time": "10000000000", "data": "{'position': [0.2, 0.0, 0.0], 'velocity': [0.1, 0.0, 0.0]}"},
+        ],
+    )
+    _write_rows(run_dir / "cmd_vel.csv", ["time", "data"], [])
+
+    result = generate_vln_task_metrics(run_dir, thresholds={"robot_radius_m": 0.0})
+
+    assert result["episode_timing"]["timed_out_by_manifest"] is True
+    assert result["episode_timing"]["timed_out"] is True
+    assert "episode_timeout" in result["strict_task_failure_reasons"]
 
 
 # --------------------------------------------------------------------------

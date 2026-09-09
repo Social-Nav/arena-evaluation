@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import heapq
 import json
 import math
 import os
@@ -35,7 +36,9 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+import numpy as np
 from PIL import Image
+from scipy.ndimage import distance_transform_edt
 
 from arena_evaluation.metrics.vln import navigation_error, ndtw, oracle_error, path_length_xy, sdtw, spl
 
@@ -53,6 +56,8 @@ DEFAULT_THRESHOLDS = {
     "max_static_collision_samples": 0,
     "max_commanded_stuck_time_sec": 0.0,
     "timeout_margin_sec": 1.0,
+    "reference_path_resolution_m": 0.05,
+    "trajectory_resample_spacing_m": 0.25,
 }
 
 
@@ -468,7 +473,8 @@ def _episode_timing(run_dir: Path, odom_samples: list[dict[str, Any]], cfg: dict
         # that coincidence.
         stamps = [int(sample["time"]) for sample in odom_samples]
         duration_sec = _time_seconds(max(stamps) - min(stamps))
-    timed_out_by_manifest = bool(result.get("timed_out")) or str(result.get("end_reason") or "").lower() == "timeout"
+    manifest_end_reason = str(result.get("end_reason") or "").lower()
+    timed_out_by_manifest = bool(result.get("timed_out")) or manifest_end_reason.endswith("timeout")
     timed_out_by_duration = math.isfinite(timeout_sec) and duration_sec >= max(0.0, timeout_sec - float(cfg["timeout_margin_sec"]))
     return {
         "timeout_sec": timeout_sec if math.isfinite(timeout_sec) else None,
@@ -493,12 +499,14 @@ class OccupancyMap:
         origin = self.metadata.get("origin") or [0.0, 0.0, 0.0]
         self.origin_x = _as_float(origin[0]) if isinstance(origin, list) and origin else 0.0
         self.origin_y = _as_float(origin[1]) if isinstance(origin, list) and len(origin) > 1 else 0.0
+        self.origin_yaw = _as_float(origin[2]) if isinstance(origin, list) and len(origin) > 2 else 0.0
         self.negate = int(_as_float(self.metadata.get("negate"), 0.0))
         self.occupied_thresh = _as_float(self.metadata.get("occupied_thresh"), 0.65)
         self.radius_px = max(0, int(math.ceil(robot_radius_m / self.resolution))) if self.resolution > 0 else 0
         self.width = 0
         self.height = 0
         self._occupied: set[tuple[int, int]] = set()
+        self._traversable = None
         if self.available and image_path is not None:
             self._load(image_path)
 
@@ -514,10 +522,33 @@ class OccupancyMap:
                 if occ >= self.occupied_thresh:
                     occupied.add((x, y))
         self._occupied = occupied
+        blocked = np.ones((self.height, self.width), dtype=bool)
+        values = np.asarray(image, dtype=np.float32) / 255.0
+        occupancy = values if self.negate else 1.0 - values
+        blocked[occupancy <= _as_float(self.metadata.get("free_thresh"), 0.196)] = False
+        clearance_px = float(self.radius_px)
+        if clearance_px > 0.0:
+            distance_px = distance_transform_edt(~blocked)
+            traversable = distance_px > clearance_px
+            edge_margin = int(math.ceil(clearance_px))
+            if edge_margin:
+                traversable[:edge_margin, :] = False
+                traversable[-edge_margin:, :] = False
+                traversable[:, :edge_margin] = False
+                traversable[:, -edge_margin:] = False
+            self._traversable = traversable
+        else:
+            self._traversable = ~blocked
 
     def world_to_pixel(self, x: float, y: float) -> tuple[int, int]:
-        px = int(math.floor((x - self.origin_x) / self.resolution))
-        py_from_bottom = int(math.floor((y - self.origin_y) / self.resolution))
+        dx = x - self.origin_x
+        dy = y - self.origin_y
+        cos_yaw = math.cos(self.origin_yaw)
+        sin_yaw = math.sin(self.origin_yaw)
+        local_x = cos_yaw * dx + sin_yaw * dy
+        local_y = -sin_yaw * dx + cos_yaw * dy
+        px = int(math.floor(local_x / self.resolution))
+        py_from_bottom = int(math.floor(local_y / self.resolution))
         return px, self.height - 1 - py_from_bottom
 
     def is_occupied_footprint(self, x: float, y: float) -> tuple[bool, tuple[int, int] | None]:
@@ -536,6 +567,24 @@ class OccupancyMap:
                     return True, candidate
         return False, None
 
+    def is_traversable_pixel(self, px: int, py: int) -> bool:
+        return bool(
+            self._traversable is not None
+            and 0 <= px < self.width
+            and 0 <= py < self.height
+            and self._traversable[py, px]
+        )
+
+    def pixel_to_world(self, px: int, py: int) -> tuple[float, float]:
+        local_x = (float(px) + 0.5) * self.resolution
+        local_y = (float(self.height - 1 - py) + 0.5) * self.resolution
+        cos_yaw = math.cos(self.origin_yaw)
+        sin_yaw = math.sin(self.origin_yaw)
+        return (
+            self.origin_x + cos_yaw * local_x - sin_yaw * local_y,
+            self.origin_y + sin_yaw * local_x + cos_yaw * local_y,
+        )
+
     def summary(self) -> dict[str, Any]:
         return {
             "map_yaml": str(self.map_yaml),
@@ -543,10 +592,184 @@ class OccupancyMap:
             "available": self.available,
             "resolution": self.resolution,
             "origin": [self.origin_x, self.origin_y],
+            "origin_yaw": self.origin_yaw,
             "width": self.width,
             "height": self.height,
             "robot_radius_px": self.radius_px,
         }
+
+
+def _resample_path(path: list[tuple[float, float]], spacing_m: float) -> list[tuple[float, float]]:
+    if len(path) < 2 or spacing_m <= 0.0:
+        return list(path)
+    distances = [0.0]
+    for first, second in zip(path[:-1], path[1:]):
+        distances.append(distances[-1] + _distance(first, second))
+    total = distances[-1]
+    if total <= 0.0:
+        return [path[0]]
+    targets = [index * spacing_m for index in range(int(math.floor(total / spacing_m)) + 1)]
+    if not targets or total - targets[-1] > 1e-9:
+        targets.append(total)
+    result = []
+    segment = 0
+    for target in targets:
+        while segment + 1 < len(distances) and distances[segment + 1] < target:
+            segment += 1
+        if segment + 1 >= len(path):
+            result.append(path[-1])
+            continue
+        span = distances[segment + 1] - distances[segment]
+        ratio = 0.0 if span <= 0.0 else (target - distances[segment]) / span
+        result.append((
+            path[segment][0] + ratio * (path[segment + 1][0] - path[segment][0]),
+            path[segment][1] + ratio * (path[segment + 1][1] - path[segment][1]),
+        ))
+    return result
+
+
+def _canonical_trajectory_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return one time-ordered trajectory using the recorder supersession rule."""
+    superseded = _superseded_ranges(samples)
+    selected = []
+    for sample in samples:
+        stamp = int(sample["time"])
+        ranges = superseded.get(int(sample.get("segment", 0)), [])
+        if any(low <= stamp <= high for low, high in ranges):
+            continue
+        selected.append(sample)
+    return sorted(selected, key=lambda sample: (int(sample["time"]), int(sample.get("segment", 0))))
+
+
+def _map_reference_path(
+    contract: dict[str, Any],
+    robot_radius_m: float,
+    planning_resolution_m: float,
+) -> tuple[list[tuple[float, float]], dict[str, Any]]:
+    map_yaml = contract.get("map_yaml")
+    start = _xy(contract.get("start_xy"))
+    goal = _xy(contract.get("goal_xy"))
+    metadata = {
+        "source": "occupancy_grid_astar",
+        "available": False,
+        "reason": None,
+        "map_yaml": map_yaml,
+        "robot_radius_m": robot_radius_m,
+        "planning_resolution_m": planning_resolution_m,
+        "connectivity": 8,
+        "diagonal_corner_cutting": False,
+    }
+    if not map_yaml or start is None or goal is None:
+        metadata["reason"] = "missing_map_or_endpoints"
+        return [], metadata
+    occ_map = OccupancyMap(Path(str(map_yaml)), robot_radius_m)
+    if not occ_map.available or occ_map.resolution <= 0.0 or occ_map._traversable is None:
+        metadata["reason"] = "occupancy_map_unavailable"
+        return [], metadata
+
+    stride = max(1, int(math.ceil(planning_resolution_m / occ_map.resolution)))
+    grid_width = (occ_map.width + stride - 1) // stride
+    grid_height = (occ_map.height + stride - 1) // stride
+
+    def node_pixel(node: tuple[int, int]) -> tuple[int, int]:
+        return (
+            min(node[0] * stride + stride // 2, occ_map.width - 1),
+            min(node[1] * stride + stride // 2, occ_map.height - 1),
+        )
+
+    padded_height = grid_height * stride
+    padded_width = grid_width * stride
+    padded = np.zeros((padded_height, padded_width), dtype=bool)
+    padded[:occ_map.height, :occ_map.width] = occ_map._traversable
+    coarse_traversable = padded.reshape(
+        grid_height, stride, grid_width, stride
+    ).all(axis=(1, 3))
+
+    def traversable(node: tuple[int, int]) -> bool:
+        if not (0 <= node[0] < grid_width and 0 <= node[1] < grid_height):
+            return False
+        return bool(coarse_traversable[node[1], node[0]])
+
+    def nearest_node(point: tuple[float, float]) -> tuple[tuple[int, int] | None, float | None]:
+        px, py = occ_map.world_to_pixel(*point)
+        center = (px // stride, py // stride)
+        max_radius = max(1, int(math.ceil(0.5 / (stride * occ_map.resolution))))
+        candidates = []
+        for radius in range(max_radius + 1):
+            for gy in range(center[1] - radius, center[1] + radius + 1):
+                for gx in range(center[0] - radius, center[0] + radius + 1):
+                    if radius and max(abs(gx - center[0]), abs(gy - center[1])) != radius:
+                        continue
+                    node = (gx, gy)
+                    if traversable(node):
+                        wx, wy = occ_map.pixel_to_world(*node_pixel(node))
+                        candidates.append((_distance(point, (wx, wy)), node))
+            if candidates:
+                distance_m, node = min(candidates)
+                return node, distance_m
+        return None, None
+
+    start_node, start_snap_m = nearest_node(start)
+    goal_node, goal_snap_m = nearest_node(goal)
+    metadata.update({
+        "map_resolution_m": occ_map.resolution,
+        "grid_stride_pixels": stride,
+        "effective_grid_resolution_m": stride * occ_map.resolution,
+        "start_pixel": list(occ_map.world_to_pixel(*start)),
+        "goal_pixel": list(occ_map.world_to_pixel(*goal)),
+        "start_snap_m": start_snap_m,
+        "goal_snap_m": goal_snap_m,
+    })
+    if start_node is None or goal_node is None:
+        metadata["reason"] = "start_or_goal_not_traversable"
+        return [], metadata
+
+    neighbours = (
+        (-1, 0, 1.0), (1, 0, 1.0), (0, -1, 1.0), (0, 1, 1.0),
+        (-1, -1, math.sqrt(2.0)), (-1, 1, math.sqrt(2.0)),
+        (1, -1, math.sqrt(2.0)), (1, 1, math.sqrt(2.0)),
+    )
+    queue = [(0.0, start_node)]
+    parent: dict[tuple[int, int], tuple[int, int]] = {}
+    cost = {start_node: 0.0}
+    while queue:
+        _, current = heapq.heappop(queue)
+        if current == goal_node:
+            break
+        current_cost = cost[current]
+        for dx, dy, step_cost in neighbours:
+            nxt = (current[0] + dx, current[1] + dy)
+            if not traversable(nxt):
+                continue
+            if dx and dy and (
+                not traversable((current[0] + dx, current[1]))
+                or not traversable((current[0], current[1] + dy))
+            ):
+                continue
+            new_cost = current_cost + step_cost
+            if new_cost >= cost.get(nxt, math.inf):
+                continue
+            cost[nxt] = new_cost
+            parent[nxt] = current
+            heuristic = math.hypot(goal_node[0] - nxt[0], goal_node[1] - nxt[1])
+            heapq.heappush(queue, (new_cost + heuristic, nxt))
+
+    if goal_node not in cost:
+        metadata["reason"] = "no_traversable_path"
+        return [], metadata
+    nodes = [goal_node]
+    while nodes[-1] != start_node:
+        nodes.append(parent[nodes[-1]])
+    nodes.reverse()
+    path = [start]
+    path.extend(occ_map.pixel_to_world(*node_pixel(node)) for node in nodes[1:-1])
+    path.append(goal)
+    metadata.update({
+        "available": True,
+        "node_count": len(nodes),
+        "path_length_m": path_length_xy(path),
+    })
+    return path, metadata
 
 
 def _static_occupancy_collisions(
@@ -718,8 +941,16 @@ def generate_vln_task_metrics(
     cmd_samples = _read_cmd_vel(run_path)
     contract = _read_scenario_contract(run_path)
     start_goal_csv = _read_start_goal_csv(run_path)
-    reference_xy = _reference_path(contract)
+    reference_xy, reference_path_info = _map_reference_path(
+        contract,
+        float(cfg["robot_radius_m"]),
+        float(cfg["reference_path_resolution_m"]),
+    )
     executed_xy = [(sample["x"], sample["y"]) for sample in odom_samples]
+    canonical_odom_samples = _canonical_trajectory_samples(odom_samples)
+    canonical_executed_xy = [
+        (sample["x"], sample["y"]) for sample in canonical_odom_samples
+    ]
 
     goal_xy = _xy(contract.get("goal_xy"))
     start_xy = _xy(contract.get("start_xy"))
@@ -728,10 +959,17 @@ def generate_vln_task_metrics(
     oracle = oracle_error(executed_xy, goal_xy) if goal_xy else math.inf
     goal_reached = nav_error <= float(cfg["goal_tolerance_m"])
     executed_len, trajectory_segment_boundaries_skipped = _trajectory_length_m(odom_samples)
-    shortest_len = path_length_xy(reference_xy)
-    metric_spl = spl(goal_reached, shortest_len, executed_len)
-    metric_ndtw = ndtw(executed_xy, reference_xy, float(cfg["goal_tolerance_m"])) if reference_xy else 0.0
-    metric_sdtw = sdtw(goal_reached, executed_xy, reference_xy, float(cfg["goal_tolerance_m"])) if reference_xy else 0.0
+    shortest_len = reference_path_info.get("path_length_m")
+    resample_spacing = float(cfg["trajectory_resample_spacing_m"])
+    executed_metric_xy = _resample_path(canonical_executed_xy, resample_spacing)
+    reference_metric_xy = _resample_path(reference_xy, resample_spacing)
+    metric_spl = spl(goal_reached, shortest_len, executed_len) if shortest_len is not None else None
+    metric_ndtw = ndtw(
+        executed_metric_xy, reference_metric_xy, float(cfg["goal_tolerance_m"])
+    ) if reference_metric_xy else None
+    metric_sdtw = sdtw(
+        goal_reached, executed_metric_xy, reference_metric_xy, float(cfg["goal_tolerance_m"])
+    ) if reference_metric_xy else None
 
     start_goal_consistency: dict[str, Any] = {
         "start_goal_csv_present": bool(start_goal_csv.get("present")),
@@ -767,6 +1005,8 @@ def generate_vln_task_metrics(
         failure_reasons.append("missing_odom")
     if not goal_xy:
         failure_reasons.append("missing_scenario_goal")
+    if not reference_path_info.get("available"):
+        failure_reasons.append("reference_path_unavailable")
     if timing["timed_out"] and not goal_reached:
         failure_reasons.append("episode_timeout")
     if not goal_reached:
@@ -788,7 +1028,7 @@ def generate_vln_task_metrics(
     )
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_dir": str(run_path),
         "time_scale": {
             "source": "arena_recorder_legacy_clock",
@@ -834,6 +1074,14 @@ def generate_vln_task_metrics(
             "spl": metric_spl,
             "ndtw": metric_ndtw,
             "sdtw": metric_sdtw,
+            "reference_path": {
+                **reference_path_info,
+                "point_count": len(reference_xy),
+                "resampled_point_count": len(reference_metric_xy),
+                "executed_resampled_point_count": len(executed_metric_xy),
+                "executed_source": "recorder_segments_with_later_segment_supersession",
+                "trajectory_resample_spacing_m": resample_spacing,
+            },
         },
         "episode_timing": timing,
         "commanded_stuck": stuck,

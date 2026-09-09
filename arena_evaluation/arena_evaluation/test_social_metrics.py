@@ -196,6 +196,55 @@ def test_social_metrics_reports_strict_footprint_collision(tmp_path):
     assert "footprint_human_collision" in result["strict_social_failure_reasons"]
 
 
+def test_social_metrics_enforces_personal_space_contract(tmp_path):
+    (tmp_path / "vln_task_metrics.json").write_text(
+        json.dumps(
+            {
+                "strict_task_success": True,
+                "strict_task_failure_reasons": [],
+                "static_occupancy": {"collision_sample_count": 0, "intervals": []},
+                "commanded_stuck": {"commanded_stuck_time_sec": 0.0, "commanded_stuck_intervals": []},
+            }
+        ),
+        encoding="utf-8",
+    )
+    _write_rows(
+        tmp_path / "odom.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "{'position': [0.0, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+            {"time": "10000000000", "data": "{'position': [0.2, 0.0, 0.0], 'velocity': [0.2, 0.0, 0.0]}"},
+        ],
+    )
+    _write_rows(
+        tmp_path / "human_states.csv",
+        ["time", "data"],
+        [
+            {"time": "0", "data": "[{'id': '1', 'position': [0.8, 0.0]}]"},
+            {"time": "10000000000", "data": "[{'id': '1', 'position': [1.1, 0.0]}]"},
+        ],
+    )
+
+    result = generate_social_metrics(
+        tmp_path,
+        thresholds={
+            "robot_radius_m": 0.0,
+            "human_radius_m": 0.0,
+            "near_miss_radius_m": 0.1,
+            "human_collision_radius_m": 0.05,
+            "min_human_motion_time_sec": 1.0,
+            "min_human_robot_motion_overlap_time_sec": 1.0,
+            "min_human_robot_interaction_time_sec": 1.0,
+        },
+    )
+
+    assert result["dynamic_scene_success"] is True
+    assert result["near_miss_count"] == 0
+    assert result["personal_space_violation_time_sec"] == pytest.approx(1.0)
+    assert result["strict_social_success"] is False
+    assert "personal_space_violation" in result["strict_social_failure_reasons"]
+
+
 def test_social_metrics_strict_failure_includes_task_failures(tmp_path):
     (tmp_path / "vln_task_metrics.json").write_text(
         json.dumps(

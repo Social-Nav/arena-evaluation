@@ -53,6 +53,7 @@ DEFAULT_THRESHOLDS = {
     "min_human_robot_motion_overlap_time_sec": 3.0,
     "min_human_robot_interaction_time_sec": 1.0,
     "human_sample_consolidation_window_sec": 0.2,
+    "max_personal_space_violation_time_sec": 0.0,
 }
 
 # The current Arena recorder stores /clock-derived integer timestamps with a
@@ -715,6 +716,8 @@ def generate_social_metrics(
         strict_social_failure_reasons.append("point_near_miss")
     if human_collision_count > 0:
         strict_social_failure_reasons.append("point_human_collision")
+    if personal_space_violation_time_sec > float(cfg["max_personal_space_violation_time_sec"]):
+        strict_social_failure_reasons.append("personal_space_violation")
     if large_teleports:
         strict_social_failure_reasons.append("large_teleport")
     if strict_task_metrics:
@@ -729,7 +732,7 @@ def generate_social_metrics(
     strict_social_success = not strict_social_failure_reasons
 
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "run_dir": str(run_path),
         "time_scale": {
             "source": "arena_recorder_legacy_clock",
